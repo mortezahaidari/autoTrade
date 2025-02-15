@@ -16,6 +16,7 @@ class Backtester:
         self.trades = []
         self.equity_curve = []
 
+    # File: backtesting/backtester.py
     def execute_trade(self, signal, price, timestamp):
         """
         Executes a trade based on the given signal.
@@ -26,12 +27,6 @@ class Backtester:
             timestamp: Timestamp of the trade.
         """
         logger.info(f"Processing signal: {signal}, Position: {self.position}, Price: {price}")
-
-        # Adjust price for slippage
-        if signal in ['buy', 'strong_buy']:
-            price *= (1 + self.slippage)
-        elif signal in ['sell', 'strong_sell']:
-            price *= (1 - self.slippage)
 
         if signal in ['buy', 'strong_buy'] and self.position == 0:
             # Execute buy order
@@ -53,6 +48,7 @@ class Backtester:
 
         # Update equity curve
         self.equity_curve.append(self.balance + (self.position * price))
+
 
     def calculate_win_rate(self):
         """

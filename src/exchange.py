@@ -4,6 +4,7 @@ import logging
 import asyncio
 import sys
 import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ✅ Fix for Windows SelectorEventLoop issue
 if sys.platform == "win32":
@@ -37,7 +38,6 @@ class Exchange:
                 'defaultType': trading_mode,  # Set trading mode (spot or margin)
             },
         })
-        
 
     async def close(self):
         """Properly close the exchange connection asynchronously."""
@@ -69,7 +69,7 @@ class Exchange:
         """Fetch the latest market price for a given trading pair."""
         ticker = await self.safe_fetch(self.exchange.fetch_ticker, symbol)
         return ticker['last'] if ticker else None
-    
+
     async def fetch_ohlcv(self, symbol, timeframe, limit=100):
         """Fetch historical OHLCV data for a trading pair asynchronously with retries."""
         retries = 3
@@ -111,14 +111,14 @@ class Exchange:
         if not balance:
             return False
 
-        base_currency, quote_currency = symbol.split("/")  
+        base_currency, quote_currency = symbol.split("/")
         base_balance = balance["total"].get(base_currency, 0)
         quote_balance = balance["total"].get(quote_currency, 0)
 
         if base_balance >= required_balance or quote_balance >= required_balance:
             logger.info(f"✅ Sufficient balance for {symbol}. Required: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
             return True
-        
+
         logger.warning(f"⚠️ Insufficient balance for {symbol}. Needed: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
         return False
 
@@ -130,10 +130,58 @@ class Exchange:
             return market["limits"]["cost"]["min"] if market and "limits" in market and "cost" in market["limits"] else None
         return None
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def place_market_order(self, symbol, side, amount):
+        """
+        Places a market order for spot trading asynchronously with retries.
+
+        Args:
+            symbol (str): The trading pair (e.g., 'BTC/USDT').
+            side (str): The order side ('buy' or 'sell').
+            amount (float): The amount of the base currency to trade.
+
+        Returns:
+            dict: The order details if successful, otherwise None.
+        """
+        try:
+            # Validate order parameters
+            if not symbol or not side or amount <= 0:
+                logger.error(f"❌ Invalid order parameters: symbol={symbol}, side={side}, amount={amount}")
+                return None
+
+            # Fetch current market price and calculate slippage
+            ticker = await self.safe_fetch(self.exchange.fetch_ticker, symbol)
+            current_price = ticker['last']
+            slippage = 0.001  # 0.1% slippage
+            adjusted_price = current_price * (1 + slippage) if side == 'buy' else current_price * (1 - slippage)
+
+            # Calculate fees (e.g., 0.1% fee)
+            fee_rate = 0.001
+            fee = amount * adjusted_price * fee_rate
+
+            # Adjust amount for fees
+            if side == 'buy':
+                amount -= fee / adjusted_price
+            else:
+                amount -= fee / adjusted_price
+
+            # Place the order
+            order = await self.exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=side,
+                amount=amount
+            )
+            logger.info(f"✅ Market {side} order executed for {amount} {symbol} at ~{adjusted_price}")
+            return order
+        except Exception as e:
+            logger.error(f"❌ Error placing market order: {e}")
+            return None
+
     async def place_margin_order(self, symbol, side, amount):
         """Places a cross-margin order with risk management (avoids liquidation)."""
         try:
-            base_currency, quote_currency = symbol.split("/")  
+            base_currency, quote_currency = symbol.split("/")
             binance_symbol = symbol.replace("/", "")
 
             # ✅ Fetch margin account details
@@ -146,7 +194,7 @@ class Exchange:
             base_balance = float(margin_assets.get(base_currency, {}).get("free", 0))
             quote_balance = float(margin_assets.get(quote_currency, {}).get("free", 0))
 
-            margin_level = float(margin_info["marginLevel"])  
+            margin_level = float(margin_info["marginLevel"])
             if margin_level < 1.2:
                 logger.error("❌ Margin level too low! Trading halted to avoid liquidation.")
                 return None
@@ -192,4 +240,17 @@ class Exchange:
         except Exception as e:
             logger.error(f"❌ Error placing {side} margin order for {amount} {symbol}: {e}")
             return None
+        
+    async def sync_time(self):
+        """Sync exchange time with Binance."""
+        try:
+            server_time = await self.exchange.public_get_time()
+            local_time = int(server_time['serverTime']) // 1000  # Convert to seconds
+            time_diff = local_time - int(time.time())
+
+            logger.info(f"🕒 Time sync: Adjusting local time difference by {time_diff} seconds.")
+            self.exchange.options['adjustForTimeDifference'] = True
+            self.exchange.options['timestamp'] = time.time() * 1000 - time_diff * 1000
+        except Exception as e:
+            logger.error(f"❌ Failed to sync time: {e}")
         

@@ -61,137 +61,6 @@ async def listen_for_exit():
 
 
 
-def set_stop_loss(symbol, current_price, data=None):
-    """
-    Calculate the stop loss using one of the following methods:
-    - Fixed percentage below the current price (default).
-    - ATR (Average True Range).
-    - Support/Resistance levels.
-    """
-    if current_price is None:
-        logger.warning("❌ Current price is None. Cannot calculate stop loss.")
-        return None  # Return None if current_price is not provided
-
-    # Method 1: Fixed percentage below the current price (default)
-    stop_loss_percentage = 0.02  # 2%
-    stop_loss = current_price * (1 - stop_loss_percentage)
-
-    # Method 2: ATR-based stop loss (uncomment to use)
-    # if data is not None and 'ATR' in data.columns:
-    #     atr_multiplier = 2  # Example multiplier
-    #     atr = data['ATR'].iloc[-1]  # Get the latest ATR value
-    #     stop_loss = current_price - (atr * atr_multiplier)
-    #     logger.debug(f"Calculated ATR-based stop loss for {symbol}: {stop_loss}")
-
-    # Method 3: Support-based stop loss (uncomment to use)
-    # if data is not None and 'Support' in data.columns:
-    #     support_level = data['Support'].iloc[-1]  # Get the latest support level
-    #     stop_loss = support_level * 0.99  # Set stop loss slightly below support
-    #     logger.debug(f"Calculated support-based stop loss for {symbol}: {stop_loss}")
-
-    logger.debug(f"Calculated stop loss for {symbol}: {stop_loss}")
-    return stop_loss
-
-last_sent_signal = None  # Store the last sent signal globally
-
-""" &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& """
-async def process_signal(signal, symbol, current_price, strategy, data):
-    """Processes the trading signal and sends a Telegram notification."""
-    global last_sent_signal  # Reference global variable
-
-    try:
-        # Construct a unique identifier for the signal (signal type + symbol)
-        signal_id = f"{signal}_{symbol}"
-
-        # Avoid sending duplicate signals
-        if signal_id == last_sent_signal:
-            logger.info(f"⚠️ Duplicate signal '{signal_id}' detected. Skipping Telegram notification.")
-            return  # Skip sending duplicate signals
-
-        # Update last sent signal before sending
-        last_sent_signal = signal_id
-
-        # Calculate stop-loss and take-profit
-        stop_loss = set_stop_loss(symbol, current_price, data)  # Ensure this function is defined
-        take_profit = current_price * 1.02  # Example take profit level
-
-        # Format current_price, stop_loss, and take_profit to 2 decimal places
-        current_price_str = f"{current_price:.2f}" if current_price is not None else "N/A"
-        stop_loss_str = f"{stop_loss:.2f}" if stop_loss is not None else "N/A"
-        take_profit_str = f"{take_profit:.2f}" if take_profit is not None else "N/A"
-
-        """ ---------------------------------------------------------------------------------------------------"""
-
-
-        if signal in ["buy", "sell"]:
-            message = f"📢 {signal.upper()} Signal detected! {symbol} at ${current_price_str}\n"
-            message += f"📉 Stop Loss: ${stop_loss_str} | 🎯 Take Profit: ${take_profit_str}"
-            logger.info(message)
-            await send_telegram_message_with_retries(signal, signal=signal_id, pair=symbol, entry_price=current_price_str, stop_loss=stop_loss_str, take_profit=take_profit_str)
-
-        elif signal in ["long", "short"]:
-            leverage = 2  # Example leverage value
-            message = f"📢 {signal.upper()} Signal detected! {symbol} at ${current_price_str}\n"
-            message += f"📉 Stop Loss: ${stop_loss_str} | 🎯 Take Profit: ${take_profit_str} | 🔝 Leverage: {leverage}x"
-            logger.info(message)
-            await send_telegram_message_with_retries(signal, signal=signal_id, pair=symbol, leverage=leverage, entry_price=current_price_str, stop_loss=stop_loss_str, take_profit=take_profit_str)
-
-
-            
-        elif signal == "neutral":
-            # Extract the indicator values
-            rsi = data['RSI'].iloc[-1] if 'RSI' in data.columns and data['RSI'].iloc[-1] is not None else None
-            macd = data['MACD'].iloc[-1] if 'MACD' in data.columns and data['MACD'].iloc[-1] is not None else None
-            bollinger_upper = data['Upper_Band'].iloc[-1] if 'Upper_Band' in data.columns and data['Upper_Band'].iloc[-1] is not None else None
-            bollinger_lower = data['Lower_Band'].iloc[-1] if 'Lower_Band' in data.columns and data['Lower_Band'].iloc[-1] is not None else None
-
-            # Safely format indicator values, checking for None
-            rsi_str = f"{rsi:.2f}" if isinstance(rsi, (float, int)) else "N/A"
-            macd_str = f"{macd:.2f}" if isinstance(macd, (float, int)) else "N/A"
-            bollinger_upper_str = f"{bollinger_upper:.2f}" if isinstance(bollinger_upper, (float, int)) else "N/A"
-            bollinger_lower_str = f"{bollinger_lower:.2f}" if isinstance(bollinger_lower, (float, int)) else "N/A"
-
-            """ ---------------------------------------------------------------------------------------------------"""
-
-            # Log the message with the formatted indicator values
-            message = f"⚖️ Neutral signal detected for {symbol} at ${current_price_str}.\n"
-            message += f"🔹 RSI: {rsi_str}\n"
-            message += f"🔹 MACD: {macd_str}\n"
-            message += f"🔹 Bollinger Bands: Upper={bollinger_upper_str}, Lower={bollinger_lower_str}\n"
-            message += "🔹 Market conditions are unclear.\n"
-            message += "🔹 Recommendation: Hold current position or reduce exposure."
-            logger.info(message)
-            await send_telegram_message_with_retries("neutral", signal=signal_id, pair=symbol, current_price=current_price_str, rsi=rsi_str, macd=macd_str, bollinger_upper=bollinger_upper_str, bollinger_lower=bollinger_lower_str)
-            
-            
-            """ ---------------------------------------------------------------------------------------------------"""
-        
-        elif signal == "strong_buy":
-            analysis = "Strong buy opportunity detected"
-            message = f"🚀 Strong Buy Signal detected! {symbol} at ${current_price_str}\n"
-            message += f"📉 Stop Loss: ${stop_loss_str} | 🎯 Take Profit: ${take_profit_str}"
-            logger.info(message)
-            await send_telegram_message_with_retries("strong_buy", signal=signal_id, pair=symbol, current_price=current_price_str, stop_loss=stop_loss_str, take_profit=take_profit_str, analysis=analysis)
-
-            """ ---------------------------------------------------------------------------------------------------"""
-
-        elif signal == "strong_sell":
-            analysis = "Strong sell opportunity detected"
-            message = f"⚠️ Strong Sell Signal detected! {symbol} at ${current_price_str}\n"
-            message += f"📉 Stop Loss: ${stop_loss_str} | 🎯 Take Profit: ${take_profit_str}"
-            logger.info(message)
-            await send_telegram_message_with_retries("strong_sell", signal=signal_id, pair=symbol, current_price=current_price_str, stop_loss=stop_loss_str, take_profit=take_profit_str, analysis=analysis)
-
-        else:
-            logger.warning(f"❌ Unknown signal received: {signal}")
-            await send_telegram_message_with_retries("error", error="An unknown signal was received.")
-
-    except Exception as e:
-        logger.error(f"❌ Error processing signal: {e}\n{traceback.format_exc()}")
-        await send_telegram_message_with_retries("error", error=f"Error processing signal: {e}")
-
-""" &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& """
-
 async def main(mode="backtest"):
     """Main function for executing the trading bot."""
     logger.info("🚀 Starting AutoTrade bot...")
@@ -330,7 +199,7 @@ async def main(mode="backtest"):
 
 if __name__ == "__main__":
     #asyncio.run(main())
-    #syncio.run(main(mode="backtest"))
-    asyncio.run(main(mode="optimize"))
+    #asyncio.run(main(mode="backtest"))
+    #asyncio.run(main(mode="optimize"))
     #asyncio.run(main(mode="paper_trade"))
-    #asyncio.run(main(mode="live_trade"))
+    asyncio.run(main(mode="live_trade"))

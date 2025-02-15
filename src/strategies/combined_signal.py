@@ -37,6 +37,7 @@ class CombinedStrategy:
         self.strong_signal_threshold = 3  # Increase from 2 to reduce false signals
         self.history_length = 5  # Consider last 5 signals instead of 3 for trend confirmation
 
+    # File: strategies/combined_signal.py
     def generate_signals(self, data):
         """
         Generates time-varying trading signals for the given data.

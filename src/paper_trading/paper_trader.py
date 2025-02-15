@@ -1,4 +1,6 @@
 import logging
+import pandas as pd
+
 
 # Initialize logger
 logging.basicConfig(
