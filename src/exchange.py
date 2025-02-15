@@ -28,7 +28,7 @@ class Exchange:
         self.api_secret = api_secret
         self.trading_mode = trading_mode
 
-        # Initialize the exchange client
+        # Initialize the exchange client directly using ccxt
         self.session = aiohttp.ClientSession()
         self.exchange = ccxt.binance({
             "apiKey": api_key,
@@ -39,6 +39,23 @@ class Exchange:
                 'defaultType': trading_mode,  # Set trading mode (spot or margin)
             },
         })
+
+    
+    
+    async def get_min_notional(self, symbol):
+        """
+        Fetch the minimum notional value for a trading pair from the exchange.
+        """
+        try:
+            market_info = await self.fetch_markets(symbol)
+            filters = market_info.get('filters', [])
+            for filter in filters:
+                if filter['filterType'] == 'MIN_NOTIONAL':
+                    return float(filter['minNotional'])
+            return None  # If no minNotional filter is found
+        except Exception as e:
+            logger.error(f"❌ Error fetching minimum notional for {symbol}: {e}")
+            return None
 
     async def fetch_binance_server_time(self):
         """
@@ -120,7 +137,7 @@ class Exchange:
 
     async def check_balance(self, symbol: str, required_balance: float) -> dict:
         """Check and return balance instead of just True/False."""
-        balance = await self.safe_fetch(self.fetch_balance)  # ✅ Fetch balance correctly
+        balance = await self.exchange.fetch_balance()  # ✅ Fetch balance directly using exchange client
 
         if not balance:
             logger.error("❌ Failed to fetch balance.")
@@ -132,19 +149,40 @@ class Exchange:
 
         if base_balance >= required_balance or quote_balance >= required_balance:
             logger.info(f"✅ Sufficient balance for {symbol}. Required: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
-
         else:
             logger.warning(f"⚠️ Insufficient balance for {symbol}. Needed: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
 
         return balance  # ✅ Return the full balance dictionary
 
-    async def get_min_trade_size(self, symbol):
-        """Fetches the minimum trade size (quote currency value) for a trading pair."""
-        markets = await self.safe_fetch(self.exchange.load_markets)
-        if markets:
-            market = markets.get(symbol)
-            return market["limits"]["cost"]["min"] if market and "limits" in market and "cost" in market["limits"] else None
-        return None
+    
+    async def fetch_markets(self):
+        try:
+            # Fetch market data with the correct method
+            response = await self.exchange.fetch_markets()
+            if not response:
+                logger.error("❌ No market data available.")
+                return None
+            return response
+        except Exception as e:
+            logger.error(f"❌ Error fetching market data: {e}")
+            return None
+
+        
+    async def get_min_order_size(self, symbol):
+        """
+        Fetch the minimum order size for a trading pair from the exchange.
+        """
+        try:
+            # Fetch market information for the symbol
+            markets = await self.fetch_markets()
+            for market in markets:
+                if market['symbol'] == symbol:
+                    return float(market['limits']['amount']['min'])
+            logger.warning(f"⚠️ Minimum order size not found for {symbol}. Using fallback value.")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error fetching minimum trade size for {symbol}: {e}")
+            return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def place_market_order(self, symbol, side, amount):

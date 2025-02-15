@@ -22,6 +22,8 @@ class LiveTrader:
         self.positions = {symbol: 0 for symbol in symbols}  # Track positions for each symbol
 
 
+
+
     async def calculate_position_size(self, symbol, current_price):
         """
         Calculate the position size for a specific symbol based on available balance and risk per trade.
@@ -39,15 +41,35 @@ class LiveTrader:
 
         logger.info(f"🔢 Available {quote_currency} balance: {available_balance}")  # Debug log
 
-        if available_balance <= 10:  # Minimum trade threshold
-            logger.warning(f"⚠️ Insufficient {quote_currency} balance to trade {symbol}.")
-            return 0.0
+        # Fetch minimum order size for the symbol
+        min_order_size = await self.exchange.get_min_order_size(symbol)
+        if min_order_size is None:
+            # Fallback to a default minimum order size (e.g., 0.00001 BTC for Binance)
+            min_order_size = 0.00001
+            logger.warning(f"⚠️ Using fallback minimum order size for {symbol}: {min_order_size}")
 
-        # ✅ Calculate position size based on risk percentage
+        # Fetch minimum notional value for the symbol
+        min_notional = await self.exchange.get_min_notional(symbol)
+        if min_notional is None:
+            # Fallback to a default minimum notional value (e.g., 10 USDT for Binance)
+            min_notional = 10
+            logger.warning(f"⚠️ Using fallback minimum notional for {symbol}: {min_notional}")
+
+        # Calculate position size based on risk percentage
         position_size = (available_balance * self.risk_percentage) / current_price
-        return position_size
 
+        # Ensure the notional value meets the minimum requirement
+        notional_value = position_size * current_price
+        if notional_value < min_notional:
+            # Adjust position size to meet the minimum notional value
+            position_size = min_notional / current_price
+            logger.info(f"📏 Adjusted position size to meet minimum notional: {position_size}")
 
+        # Ensure the position size meets the minimum order size
+        return max(position_size, min_order_size)
+    
+
+    
     async def manage_risk(self, symbol, current_price):
         """
         Adjust stop-loss and take-profit dynamically for a specific symbol.
@@ -65,7 +87,8 @@ class LiveTrader:
                     amount=position,
                     type='stop_loss_limit',
                     stop_price=stop_loss,
-                    price=stop_loss
+                    price=stop_loss,
+                    reduce_only=True  # Ensure this order only reduces the position
                 )
                 await self.exchange.place_order(
                     symbol=symbol,
@@ -73,7 +96,8 @@ class LiveTrader:
                     amount=position,
                     type='take_profit_limit',
                     stop_price=take_profit,
-                    price=take_profit
+                    price=take_profit,
+                    reduce_only=True  # Ensure this order only reduces the position
                 )
                 logger.info(f"🎯 Updated stop-loss: ${stop_loss:.2f}, take-profit: ${take_profit:.2f} for {symbol}")
             except Exception as e:
@@ -90,20 +114,26 @@ class LiveTrader:
             logger.warning(f"⚠️ Position size is 0 for {symbol}. No trade will be executed.")
             return
 
-        if signal == 'buy' and self.positions[symbol] == 0:
-            logger.info(f"🛒 Attempting to BUY {position_size} {symbol} at {current_price}")  # Debug log
-            order = await self.exchange.execute_trade(symbol, 'buy', position_size)
-            if order:
-                self.positions[symbol] = order['filled']
-                logger.info(f"✅ BUY order executed for {symbol} at ${current_price:.2f} with size {position_size}")
+        try:
+            if signal == 'buy' and self.positions[symbol] == 0:
+                logger.info(f"🛒 Attempting to BUY {position_size} {symbol} at {current_price}")  # Debug log
+                order = await self.exchange.place_market_order(symbol=symbol, side='buy', amount=position_size)
+                if order and 'filled' in order:
+                    self.positions[symbol] = float(order['filled'])
+                    logger.info(f"✅ BUY order executed for {symbol} at ${current_price:.2f} with size {position_size}")
+                else:
+                    logger.error(f"❌ Failed to execute BUY order for {symbol}: {order}")
 
-        elif signal == 'sell' and self.positions[symbol] > 0:
-            logger.info(f"📤 Attempting to SELL {self.positions[symbol]} {symbol} at {current_price}")  # Debug log
-            order = await self.exchange.execute_trade(symbol, 'sell', self.positions[symbol])
-            if order:
-                self.positions[symbol] = 0
-                logger.info(f"✅ SELL order executed for {symbol} at ${current_price:.2f}")
-
+            elif signal == 'sell' and self.positions[symbol] > 0:
+                logger.info(f"📤 Attempting to SELL {self.positions[symbol]} {symbol} at {current_price}")  # Debug log
+                order = await self.exchange.place_market_order(symbol=symbol, side='sell', amount=self.positions[symbol])
+                if order and 'filled' in order:
+                    self.positions[symbol] = 0
+                    logger.info(f"✅ SELL order executed for {symbol} at ${current_price:.2f}")
+                else:
+                    logger.error(f"❌ Failed to execute SELL order for {symbol}: {order}")
+        except Exception as e:
+            logger.error(f"❌ Error executing trade for {symbol}: {e}")
 
     async def trade_multiple_symbols(self, signals):
         """
