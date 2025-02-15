@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class CombinedStrategy:
-    def __init__(self):
+    def __init__(self, required_bars=50):
         # Initialize strategies
         self.rsi = RSIStrategy()
         self.macd = MACDStrategy()
@@ -37,6 +37,8 @@ class CombinedStrategy:
         self.strong_signal_threshold = 3  # Increase from 2 to reduce false signals
         self.history_length = 5  # Consider last 5 signals instead of 3 for trend confirmation
 
+        self.required_bars = required_bars
+
     # File: strategies/combined_signal.py
     def generate_signals(self, data):
         """
@@ -48,6 +50,11 @@ class CombinedStrategy:
         Returns:
             pd.Series: Trading signals for each row in the data (e.g., 'buy', 'sell', 'neutral').
         """
+
+        if data.empty or len(data) < self.required_bars:
+            logger.warning(f"⚠️ Not enough data for {self.__class__.__name__}. Skipping signal generation.")
+            return pd.Series(['neutral'] * len(data), index=data.index)
+    
         # Generate signals from all strategies
         strategies = {
             'RSI': self.rsi,

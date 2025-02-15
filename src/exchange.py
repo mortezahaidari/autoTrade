@@ -1,12 +1,13 @@
-import ccxt.async_support as ccxt  # Async version of ccxt
+import ccxt.async_support as ccxt
 import pandas as pd
 import logging
 import asyncio
 import sys
 import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential
+import time
 
-# ✅ Fix for Windows SelectorEventLoop issue
+# Fix for Windows SelectorEventLoop issue
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -39,19 +40,35 @@ class Exchange:
             },
         })
 
+    async def fetch_binance_server_time(self):
+        """
+        Fetch the current server time from Binance.
+        """
+        try:
+            server_time = await self.safe_fetch(self.exchange.public_get_time)
+            return server_time["serverTime"]
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch Binance server time: {e}")
+            return None
+
     async def close(self):
         """Properly close the exchange connection asynchronously."""
         await self.exchange.close()
         await self.session.close()
 
     async def safe_fetch(self, func, *args, **kwargs):
-        """Wrapper to retry API calls with error handling."""
+        """Wrapper to retry API calls while avoiding recursion issues."""
         retries = kwargs.pop("retries", 3)
         delay = kwargs.pop("delay", 2)
 
         for i in range(retries):
             try:
+                # Only sync time if calling a non-time related function
+                if func != self.exchange.public_get_time and not self.exchange.options.get("adjustForTimeDifference"):
+                    await self.sync_time()
+
                 return await func(*args, **kwargs)
+
             except (ccxt.NetworkError, ccxt.DDoSProtection, ccxt.RequestTimeout) as e:
                 logger.warning(f"⚠️ Network issue during {func.__name__}: {e}. Retrying {i+1}/{retries}...")
             except ccxt.ExchangeError as e:
@@ -71,45 +88,43 @@ class Exchange:
         return ticker['last'] if ticker else None
 
     async def fetch_ohlcv(self, symbol, timeframe, limit=100):
-        """Fetch historical OHLCV data for a trading pair asynchronously with retries."""
+        """Fetch OHLCV data while ensuring Binance time sync."""
+        if not self.exchange.options.get("adjustForTimeDifference"):
+            await self.sync_time()  # Call time sync only if needed
+
         retries = 3
         delay = 2
 
         for i in range(retries):
             try:
                 ohlcv = await self.safe_fetch(self.exchange.fetch_ohlcv, symbol, timeframe, limit=limit)
+                if not ohlcv or len(ohlcv) == 0:
+                    logger.warning(f"⚠️ No OHLCV data received for {symbol}. Returning empty dataset.")
+                    return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-                if ohlcv and len(ohlcv) > 0:
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-                    if 'close' not in df.columns or df.empty:
-                        logger.warning("❌ Fetched OHLCV data does not contain 'close' prices. Retrying...")
-                        await asyncio.sleep(delay)
-                        continue
-
-                    # Log only the latest close price
-                    logger.info(f"✅ Successfully fetched OHLCV data for {symbol} ({timeframe}). Latest close: {df['close'].iloc[-1]}")
-                    return df  # ✅ Return the DataFrame
-
-                logger.warning("⚠️ Fetched OHLCV data is empty. Retrying...")
-                await asyncio.sleep(delay)
+                logger.info(f"✅ Successfully fetched OHLCV data for {symbol} ({timeframe}). Latest close: {df['close'].iloc[-1]}")
+                return df
 
             except Exception as e:
                 logger.error(f"❌ Error fetching OHLCV data (attempt {i+1}/{retries}): {e}")
                 if i < retries - 1:
                     await asyncio.sleep(delay)
                 else:
-                    logger.error("❌ Max retries reached. Unable to fetch OHLCV data.")
-                    return pd.DataFrame()  # Return empty DataFrame on failure
+                    logger.error("❌ Max retries reached. Returning empty dataset.")
+                    return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-        return pd.DataFrame()  # Fallback return
+        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # Fallback return
 
-    async def check_balance(self, symbol: str, required_balance: float) -> bool:
-        """Check if there is enough balance to place an order."""
-        balance = await self.safe_fetch(self.exchange.fetch_balance)
+    async def check_balance(self, symbol: str, required_balance: float) -> dict:
+        """Check and return balance instead of just True/False."""
+        balance = await self.safe_fetch(self.fetch_balance)  # ✅ Fetch balance correctly
+
         if not balance:
-            return False
+            logger.error("❌ Failed to fetch balance.")
+            return {}  # ✅ Return an empty dictionary instead of False
 
         base_currency, quote_currency = symbol.split("/")
         base_balance = balance["total"].get(base_currency, 0)
@@ -117,10 +132,11 @@ class Exchange:
 
         if base_balance >= required_balance or quote_balance >= required_balance:
             logger.info(f"✅ Sufficient balance for {symbol}. Required: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
-            return True
 
-        logger.warning(f"⚠️ Insufficient balance for {symbol}. Needed: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
-        return False
+        else:
+            logger.warning(f"⚠️ Insufficient balance for {symbol}. Needed: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
+
+        return balance  # ✅ Return the full balance dictionary
 
     async def get_min_trade_size(self, symbol):
         """Fetches the minimum trade size (quote currency value) for a trading pair."""
@@ -184,7 +200,7 @@ class Exchange:
             base_currency, quote_currency = symbol.split("/")
             binance_symbol = symbol.replace("/", "")
 
-            # ✅ Fetch margin account details
+            # Fetch margin account details
             margin_info = await self.safe_fetch(self.exchange.sapi_get_margin_account)
             if not margin_info:
                 logger.error("❌ Failed to fetch margin account details.")
@@ -213,7 +229,7 @@ class Exchange:
                 order = await self.safe_fetch(self.exchange.sapi_post_margin_order, params={
                     "symbol": binance_symbol,
                     "side": "SELL",
-                    "type": "MARKET",
+                    "type": "MARGIN",
                     "quantity": amount,
                     "isIsolated": "FALSE"
                 })
@@ -230,7 +246,7 @@ class Exchange:
                 order = await self.safe_fetch(self.exchange.sapi_post_margin_order, params={
                     "symbol": binance_symbol,
                     "side": "BUY",
-                    "type": "MARKET",
+                    "type": "MARGIN",
                     "quantity": amount,
                     "isIsolated": "FALSE"
                 })
@@ -240,17 +256,25 @@ class Exchange:
         except Exception as e:
             logger.error(f"❌ Error placing {side} margin order for {amount} {symbol}: {e}")
             return None
-        
-    async def sync_time(self):
-        """Sync exchange time with Binance."""
-        try:
-            server_time = await self.exchange.public_get_time()
-            local_time = int(server_time['serverTime']) // 1000  # Convert to seconds
-            time_diff = local_time - int(time.time())
 
+    async def sync_time(self):
+        """Sync exchange time with Binance to prevent timestamp errors."""
+        try:
+            server_time = await self.safe_fetch(self.exchange.public_get_time)
+
+            if not server_time:
+                logger.error("❌ Failed to sync Binance server time. Skipping time adjustment.")
+                return
+
+            binance_time = int(server_time['serverTime']) // 1000  # Convert to seconds
+            local_time = int(time.time())
+
+            time_diff = binance_time - local_time
             logger.info(f"🕒 Time sync: Adjusting local time difference by {time_diff} seconds.")
+
+            # Apply time adjustment safely
             self.exchange.options['adjustForTimeDifference'] = True
-            self.exchange.options['timestamp'] = time.time() * 1000 - time_diff * 1000
+            self.exchange.options['timestamp'] = binance_time * 1000  # Ensure it's in ms
+
         except Exception as e:
-            logger.error(f"❌ Failed to sync time: {e}")
-        
+            logger.error(f"❌ Error syncing Binance time: {e}")
