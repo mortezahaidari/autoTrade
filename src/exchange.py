@@ -1,318 +1,269 @@
+# exchange.py
 import ccxt.async_support as ccxt
 import pandas as pd
 import logging
 import asyncio
 import sys
 import aiohttp
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import *
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple, Any
 import time
 
-# Fix for Windows SelectorEventLoop issue
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-# Initialize logger
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-class Exchange:
-    def __init__(self, api_key, api_secret, trading_mode='spot'):
-        """
-        Initialize the Binance exchange asynchronously.
+# Windows event loop fix
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-        :param api_key: API key for the exchange.
-        :param api_secret: API secret for the exchange.
-        :param trading_mode: Trading mode, either 'spot' or 'margin'. Defaults to 'spot'.
-        """
+# =====================
+# Exception Classes
+# =====================
+class ExchangeError(Exception):
+    """Base exception for all exchange-related errors"""
+    pass
+
+class DataValidationError(ExchangeError):
+    """Raised when data validation fails"""
+    pass
+
+class CircuitBreakerOpen(ExchangeError):
+    """Raised when circuit breaker is active"""
+    pass
+
+# =====================
+# Data Classes
+# =====================
+@dataclass
+class ExchangeConfig:
+    """Central configuration for exchange behavior"""
+    max_retries: int = 3
+    retry_delay: float = 2.0
+    slippage: float = 0.001  # 0.1% default slippage
+    fee_rate: float = 0.001  # 0.1% default fee
+    min_margin_level: float = 1.2
+    sync_interval: int = 300  # 5 minutes
+    circuit_breaker_threshold: int = 5
+
+@dataclass
+class OrderParams:
+    """Container for validated order parameters"""
+    amount: float    # Executable amount after adjustments
+    price: float     # Slippage-adjusted price
+    fee: float       # Calculated fee amount
+    original_amount: float  # Requested amount before adjustments
+
+# =====================
+# Circuit Breaker
+# =====================
+class CircuitBreaker:
+    """Protects against repeated API failures"""
+    
+    def __init__(self, threshold: int):
+        self.failure_count = 0
+        self.threshold = threshold
+        self.state = "CLOSED"
+
+    def record_failure(self):
+        """Track failures and update state"""
+        self.failure_count += 1
+        if self.failure_count >= self.threshold:
+            self.state = "OPEN"
+            logger.critical("API circuit breaker opened!")
+
+    def is_open(self):
+        """Check if circuit breaker is active"""
+        return self.state == "OPEN"
+
+# =====================
+# Base Exchange Class
+# =====================
+class BaseExchange:
+    """Core exchange functionality with safety features"""
+    
+    def __init__(self, api_key: str, api_secret: str, config: ExchangeConfig = ExchangeConfig()):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.trading_mode = trading_mode
+        self.config = config
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.exchange: Optional[ccxt.Exchange] = None
+        self.circuit_breaker = CircuitBreaker(config.circuit_breaker_threshold)
+        self._last_sync = 0
 
-        # Initialize the exchange client directly using ccxt
+    async def __aenter__(self):
+        """Context manager entry"""
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, *exc_info):
+        """Context manager exit"""
+        await self.close()
+
+    async def initialize(self):
+        """Initialize exchange connection"""
+        if self.circuit_breaker.is_open():
+            raise CircuitBreakerOpen("API access suspended")
+            
         self.session = aiohttp.ClientSession()
         self.exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": api_secret,
+            "apiKey": self.api_key,
+            "secret": self.api_secret,
             "enableRateLimit": True,
             "session": self.session,
-            'options': {
-                'defaultType': trading_mode,  # Set trading mode (spot or margin)
-            },
+            'options': {'adjustForTimeDifference': False},
         })
-
-    
-    
-    async def get_min_notional(self, symbol):
-        """
-        Fetch the minimum notional value for a trading pair from the exchange.
-        """
-        try:
-            market_info = await self.fetch_markets(symbol)
-            filters = market_info.get('filters', [])
-            for filter in filters:
-                if filter['filterType'] == 'MIN_NOTIONAL':
-                    return float(filter['minNotional'])
-            return None  # If no minNotional filter is found
-        except Exception as e:
-            logger.error(f"❌ Error fetching minimum notional for {symbol}: {e}")
-            return None
-
-    async def fetch_binance_server_time(self):
-        """
-        Fetch the current server time from Binance.
-        """
-        try:
-            server_time = await self.safe_fetch(self.exchange.public_get_time)
-            return server_time["serverTime"]
-        except Exception as e:
-            logger.error(f"❌ Failed to fetch Binance server time: {e}")
-            return None
+        await self.sync_time(force=True)
 
     async def close(self):
-        """Properly close the exchange connection asynchronously."""
-        await self.exchange.close()
-        await self.session.close()
+        """Cleanup resources"""
+        if self.exchange:
+            await self.exchange.close()
+        if self.session:
+            await self.session.close()
 
-    async def safe_fetch(self, func, *args, **kwargs):
-        """Wrapper to retry API calls while avoiding recursion issues."""
-        retries = kwargs.pop("retries", 3)
-        delay = kwargs.pop("delay", 2)
-
-        for i in range(retries):
+    async def sync_time(self, force: bool = False):
+        """Synchronize exchange timestamps"""
+        if force or (time.time() - self._last_sync) > self.config.sync_interval:
             try:
-                # Only sync time if calling a non-time related function
-                if func != self.exchange.public_get_time and not self.exchange.options.get("adjustForTimeDifference"):
-                    await self.sync_time()
-
-                return await func(*args, **kwargs)
-
-            except (ccxt.NetworkError, ccxt.DDoSProtection, ccxt.RequestTimeout) as e:
-                logger.warning(f"⚠️ Network issue during {func.__name__}: {e}. Retrying {i+1}/{retries}...")
-            except ccxt.ExchangeError as e:
-                logger.error(f"❌ Exchange error during {func.__name__}: {e}")
-                break  # Stop retries on critical exchange errors
+                server_time = await self.exchange.public_get_time()
+                self.exchange.options['timestamp'] = server_time['serverTime']
+                self._last_sync = time.time()
             except Exception as e:
-                logger.error(f"❌ Unexpected error during {func.__name__}: {e}")
-                break  # Stop retries for unknown errors
-            await asyncio.sleep(delay)
+                logger.error(f"Time sync failed: {str(e)}")
 
-        logger.error("❌ Max retries reached. Request failed.")
-        return None
-
-    async def fetch_latest_price(self, symbol):
-        """Fetch the latest market price for a given trading pair."""
-        ticker = await self.safe_fetch(self.exchange.fetch_ticker, symbol)
-        return ticker['last'] if ticker else None
-
-    async def fetch_ohlcv(self, symbol, timeframe, limit=100):
-        """Fetch OHLCV data while ensuring Binance time sync."""
-        if not self.exchange.options.get("adjustForTimeDifference"):
-            await self.sync_time()  # Call time sync only if needed
-
-        retries = 3
-        delay = 2
-
-        for i in range(retries):
-            try:
-                ohlcv = await self.safe_fetch(self.exchange.fetch_ohlcv, symbol, timeframe, limit=limit)
-                if not ohlcv or len(ohlcv) == 0:
-                    logger.warning(f"⚠️ No OHLCV data received for {symbol}. Returning empty dataset.")
-                    return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-
-                logger.info(f"✅ Successfully fetched OHLCV data for {symbol} ({timeframe}). Latest close: {df['close'].iloc[-1]}")
-                return df
-
-            except Exception as e:
-                logger.error(f"❌ Error fetching OHLCV data (attempt {i+1}/{retries}): {e}")
-                if i < retries - 1:
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error("❌ Max retries reached. Returning empty dataset.")
-                    return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
-        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # Fallback return
-
-    async def check_balance(self, symbol: str, required_balance: float) -> dict:
-        """Check and return balance instead of just True/False."""
-        balance = await self.exchange.fetch_balance()  # ✅ Fetch balance directly using exchange client
-
-        if not balance:
-            logger.error("❌ Failed to fetch balance.")
-            return {}  # ✅ Return an empty dictionary instead of False
-
-        base_currency, quote_currency = symbol.split("/")
-        base_balance = balance["total"].get(base_currency, 0)
-        quote_balance = balance["total"].get(quote_currency, 0)
-
-        if base_balance >= required_balance or quote_balance >= required_balance:
-            logger.info(f"✅ Sufficient balance for {symbol}. Required: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
-        else:
-            logger.warning(f"⚠️ Insufficient balance for {symbol}. Needed: {required_balance}, Available: {base_balance} {base_currency} / {quote_balance} {quote_currency}")
-
-        return balance  # ✅ Return the full balance dictionary
-
+# =====================
+# Spot Trading
+# =====================
+class BinanceSpot(BaseExchange):
+    """Binance Spot Trading Implementation"""
     
-    async def fetch_markets(self):
-        try:
-            # Fetch market data with the correct method
-            response = await self.exchange.fetch_markets()
-            if not response:
-                logger.error("❌ No market data available.")
-                return None
-            return response
-        except Exception as e:
-            logger.error(f"❌ Error fetching market data: {e}")
-            return None
-
-        
-    async def get_min_order_size(self, symbol):
-        """
-        Fetch the minimum order size for a trading pair from the exchange.
-        """
-        try:
-            # Fetch market information for the symbol
-            markets = await self.fetch_markets()
-            for market in markets:
-                if market['symbol'] == symbol:
-                    return float(market['limits']['amount']['min'])
-            logger.warning(f"⚠️ Minimum order size not found for {symbol}. Using fallback value.")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Error fetching minimum trade size for {symbol}: {e}")
-            return None
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.exchange.options['defaultType'] = 'spot'
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    async def place_market_order(self, symbol, side, amount):
+    async def place_order(self, symbol: str, side: str, amount: float, 
+                        order_type: str = 'market', params: dict = None) -> dict:
         """
-        Places a market order for spot trading asynchronously with retries.
-
-        Args:
-            symbol (str): The trading pair (e.g., 'BTC/USDT').
-            side (str): The order side ('buy' or 'sell').
-            amount (float): The amount of the base currency to trade.
-
-        Returns:
-            dict: The order details if successful, otherwise None.
+        Execute spot order with:
+        - Automatic slippage adjustment
+        - Fee calculations
+        - Circuit breaker protection
         """
         try:
-            # Validate order parameters
-            if not symbol or not side or amount <= 0:
-                logger.error(f"❌ Invalid order parameters: symbol={symbol}, side={side}, amount={amount}")
-                return None
+            params = params or {}
+            if self.circuit_breaker.is_open():
+                raise CircuitBreakerOpen()
 
-            # Fetch current market price and calculate slippage
-            ticker = await self.safe_fetch(self.exchange.fetch_ticker, symbol)
-            current_price = ticker['last']
-            slippage = 0.001  # 0.1% slippage
-            adjusted_price = current_price * (1 + slippage) if side == 'buy' else current_price * (1 - slippage)
-
-            # Calculate fees (e.g., 0.1% fee)
-            fee_rate = 0.001
-            fee = amount * adjusted_price * fee_rate
-
-            # Adjust amount for fees
-            if side == 'buy':
-                amount -= fee / adjusted_price
-            else:
-                amount -= fee / adjusted_price
-
-            # Place the order
-            order = await self.exchange.create_order(
+            # Calculate order parameters
+            order_params = await self._calculate_order_params(symbol, side, amount)
+            
+            # Execute order
+            return await self.exchange.create_order(
                 symbol=symbol,
-                type='market',
+                type=order_type,
                 side=side,
-                amount=amount
+                amount=order_params.amount,
+                price=order_params.price,
+                params=params
             )
-            logger.info(f"✅ Market {side} order executed for {amount} {symbol} at ~{adjusted_price}")
-            return order
         except Exception as e:
-            logger.error(f"❌ Error placing market order: {e}")
-            return None
+            self.circuit_breaker.record_failure()
+            logger.error(f"Spot order failed: {str(e)}")
+            raise
 
-    async def place_margin_order(self, symbol, side, amount):
-        """Places a cross-margin order with risk management (avoids liquidation)."""
+    async def _calculate_order_params(self, symbol: str, side: str, amount: float) -> OrderParams:
+        """Calculate fees, slippage, and validate amounts"""
+        ticker = await self.exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+        
+        # Calculate adjusted price with slippage
+        slippage_price = current_price * (1 + self.config.slippage * (1 if side == 'buy' else -1))
+        
+        # Calculate fees
+        fee = amount * slippage_price * self.config.fee_rate
+        
+        # Adjust amount for fees
+        adjusted_amount = amount - (fee / slippage_price)
+        
+        return OrderParams(
+            amount=adjusted_amount,
+            price=slippage_price,
+            fee=fee,
+            original_amount=amount
+        )
+
+# =====================
+# Margin Trading
+# =====================
+class BinanceMargin(BinanceSpot):
+    """Binance Margin Trading Implementation"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.exchange.options['defaultType'] = 'margin'
+
+    async def place_order(self, symbol: str, side: str, amount: float, 
+                        order_type: str = 'market', params: dict = None) -> dict:
+        """Margin order with risk checks"""
         try:
-            base_currency, quote_currency = symbol.split("/")
-            binance_symbol = symbol.replace("/", "")
-
-            # Fetch margin account details
-            margin_info = await self.safe_fetch(self.exchange.sapi_get_margin_account)
-            if not margin_info:
-                logger.error("❌ Failed to fetch margin account details.")
-                return None
-
-            margin_assets = {asset["asset"]: asset for asset in margin_info["userAssets"]}
-            base_balance = float(margin_assets.get(base_currency, {}).get("free", 0))
-            quote_balance = float(margin_assets.get(quote_currency, {}).get("free", 0))
-
-            margin_level = float(margin_info["marginLevel"])
-            if margin_level < 1.2:
-                logger.error("❌ Margin level too low! Trading halted to avoid liquidation.")
-                return None
-
-            latest_price = await self.fetch_latest_price(symbol)
-            if not latest_price:
-                logger.error(f"❌ Could not fetch latest price for {symbol}. Order aborted.")
-                return None
-
-            if side == "sell":
-                if base_balance < amount:
-                    borrow_amount = amount - base_balance
-                    await self.safe_fetch(self.exchange.sapi_post_margin_loan, params={"asset": base_currency, "amount": borrow_amount})
-                    logger.info(f"✅ Borrowed {borrow_amount} {base_currency} for shorting.")
-
-                order = await self.safe_fetch(self.exchange.sapi_post_margin_order, params={
-                    "symbol": binance_symbol,
-                    "side": "SELL",
-                    "type": "MARGIN",
-                    "quantity": amount,
-                    "isIsolated": "FALSE"
-                })
-                logger.info(f"✅ Short position executed: {amount} {base_currency} sold.")
-                return order
-
-            elif side == "buy":
-                required_funds = amount * latest_price
-                if quote_balance < required_funds:
-                    borrow_amount = required_funds - quote_balance
-                    await self.safe_fetch(self.exchange.sapi_post_margin_loan, params={"asset": quote_currency, "amount": borrow_amount})
-                    logger.info(f"✅ Borrowed {borrow_amount} {quote_currency} for buying {base_currency}.")
-
-                order = await self.safe_fetch(self.exchange.sapi_post_margin_order, params={
-                    "symbol": binance_symbol,
-                    "side": "BUY",
-                    "type": "MARGIN",
-                    "quantity": amount,
-                    "isIsolated": "FALSE"
-                })
-                logger.info(f"✅ Long position executed: {amount} {base_currency} bought.")
-                return order
-
+            if not await self._check_margin_health(symbol, side, amount):
+                raise ExchangeError("Margin requirements not met")
+                
+            return await super().place_order(symbol, side, amount, order_type, params)
         except Exception as e:
-            logger.error(f"❌ Error placing {side} margin order for {amount} {symbol}: {e}")
-            return None
+            logger.error(f"Margin order failed: {str(e)}")
+            raise
 
-    async def sync_time(self):
-        """Sync exchange time with Binance to prevent timestamp errors."""
+    async def _check_margin_health(self, symbol: str, side: str, amount: float) -> bool:
+        """Verify margin account health"""
+        margin_account = await self.exchange.fetch_balance()
+        margin_level = float(margin_account.get('marginLevel', 0))
+        return margin_level >= self.config.min_margin_level
+
+# =====================
+# Advanced Features
+# =====================
+class AdvancedExchange(BinanceMargin):
+    """Unified exchange interface with enhanced features"""
+    
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, 
+                        limit: int = 100, params: dict = None) -> pd.DataFrame:
+        """Fetch and validate OHLCV data"""
         try:
-            server_time = await self.safe_fetch(self.exchange.public_get_time)
-
-            if not server_time:
-                logger.error("❌ Failed to sync Binance server time. Skipping time adjustment.")
-                return
-
-            binance_time = int(server_time['serverTime']) // 1000  # Convert to seconds
-            local_time = int(time.time())
-
-            time_diff = binance_time - local_time
-            logger.info(f"🕒 Time sync: Adjusting local time difference by {time_diff} seconds.")
-
-            # Apply time adjustment safely
-            self.exchange.options['adjustForTimeDifference'] = True
-            self.exchange.options['timestamp'] = binance_time * 1000  # Ensure it's in ms
-
+            await self.sync_time()
+            data = await self.exchange.fetch_ohlcv(symbol, timeframe, limit, params)
+            return self._validate_ohlcv(data)
         except Exception as e:
-            logger.error(f"❌ Error syncing Binance time: {e}")
+            logger.error(f"OHLCV fetch failed: {str(e)}")
+            return pd.DataFrame()
+
+    def _validate_ohlcv(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Ensure data quality standards"""
+        required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        if not all(col in data.columns for col in required):
+            raise DataValidationError("Invalid OHLCV structure")
+        return data.dropna().reset_index(drop=True)
+
+# =====================
+# Legacy Compatibility
+# =====================
+class Exchange(AdvancedExchange):
+    """Maintains original interface for backward compatibility"""
+    
+    async def place_market_order(self, symbol: str, side: str, amount: float) -> dict:
+        """Legacy market order interface"""
+        return await self.place_order(symbol, side, amount, 'market')
+
+    async def place_margin_order(self, symbol: str, side: str, amount: float) -> dict:
+        """Legacy margin order interface"""
+        return await self.place_order(
+            symbol, side, amount, 'market', 
+            {'marginMode': 'cross'}
+        )
+
+    async def fetch_balance(self) -> dict:
+        """Legacy balance check"""
+        return await self.exchange.fetch_balance()

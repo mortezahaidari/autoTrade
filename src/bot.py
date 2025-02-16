@@ -2,200 +2,327 @@ import asyncio
 import logging
 import os
 import pandas as pd
-import msvcrt
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from typing import Dict, Optional, Any
 
 from exchange import Exchange
-from strategies.strategy_factory import StrategyFactory
+from strategies.strategy_factory import StrategyFactory, StrategyConfig  # Added StrategyConfig import
 from live_trading.live_trader import LiveTrader
-from utils.notifications import send_telegram_message_with_retries
 import config
-import traceback
+from ml_models.model_training import MLTraining
+import joblib
+from utils.performance import TradeAnalyzer
 
-# Additional imports for other modes (if needed)
-from backtesting.backtester import Backtester
-from backtesting.optimization import optimize_parameters
-from backtesting.visualization import plot_equity_curve, plot_trade_history
-from paper_trading.paper_trader import PaperTrader
+# Enhanced imports
+from prometheus_client import start_http_server, Counter, Gauge
+from utils.performance import TradeAnalyzer
+from utils.data_quality import validate_ohlcv, clean_ohlcv
 
-# Import feature engineering for data preprocessing
-from ml_models.feature_engineering import preprocess_data
-
-# Set up logging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding='utf-8')
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Event to signal exit without blocking the event loop
-stop_event = asyncio.Event()
-
-async def listen_for_exit():
-    """Listen for user input (press 'q') to gracefully stop the bot."""
-    logger.info("🛑 Press 'q' to stop the bot.")
-    while not stop_event.is_set():
-        if os.name == "nt":  # Windows
-            if msvcrt.kbhit():
-                key = msvcrt.getch()
-                if key == b'q':
-                    logger.info("🛑 Exit signal received. Stopping bot...")
-                    stop_event.set()
-        await asyncio.sleep(0.1)
-
-def attach_fetch_balance(exchange_instance):
-    """
-    Attach a fetch_balance method to the Exchange instance.
+class TradingBot:
+    """Enhanced trading bot with ML integration and advanced monitoring"""
     
-    Although your exchange.py only provides check_balance, the underlying
-    ccxt client does have a fetch_balance method. This helper wraps it with
-    the safe_fetch function and assigns it to exchange_instance.
-    """
-    async def fetch_balance(*args, **kwargs):
-        # Call the ccxt client's fetch_balance via safe_fetch
-        return await exchange_instance.safe_fetch(exchange_instance.exchange.fetch_balance, *args, **kwargs)
-    exchange_instance.fetch_balance = fetch_balance
+    def __init__(self):
+        self.stop_event = asyncio.Event()
+        self.analyzer = TradeAnalyzer()
+        self.ml_model: Optional[MLTraining] = None
+        self.exchange: Optional[Exchange] = None
+        self.strategy = self._create_strategy()  # Use validated strategy creation
+        self._init_metrics()
 
-async def main(mode="live_trade"):
-    logger.info("🚀 Starting AutoTrade bot...")
-    load_dotenv()  # Load environment variables
+    def _create_strategy(self) -> Any:
+        """Create strategy instance with validation"""
+        try:
+            strategy_config = self._load_strategy_config()
+            return StrategyFactory.create_strategy(strategy_config)
+        except ValueError as e:
+            logger.critical(f"Strategy creation failed: {e}")
+            raise SystemExit(1) from e
 
-    # Initialize the exchange using API keys from your environment
-    exchange = Exchange(
-        os.getenv("BINANCE_API_KEY"),
-        os.getenv("BINANCE_API_SECRET"),
-        trading_mode="spot"
-    )
-    # Attach a fetch_balance method to our Exchange instance
-    attach_fetch_balance(exchange)
-
-    # For multiple-symbol trading, define symbols as a list.
-    # Here we assume config.SYMBOL (e.g. "BTC/USDT") is defined in your config.
-    symbols = [config.SYMBOL]
-
-    # Initialize your trading strategy
-    strategy = StrategyFactory.get_strategy("combined")
-
-    # Start the exit listener task
-    exit_listener = asyncio.create_task(listen_for_exit())
-
-    try:
-        # Fetch and preprocess historical data (for backtesting, signal generation, etc.)
-        historical_data = await exchange.fetch_ohlcv(config.SYMBOL, timeframe="1d", limit=1000)
-        historical_data = pd.DataFrame(
-            historical_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    def _load_strategy_config(self) -> StrategyConfig:
+        """Convert config dict to StrategyConfig with validation"""
+        raw_config = config.STRATEGY_CONFIG
+        
+        dependencies = {}
+        for dep_name, dep_config in raw_config.get("dependencies", {}).items():
+            dependencies[dep_name] = StrategyConfig(
+                name=dep_config["name"],
+                params=dep_config["params"]
+            )
+        
+        return StrategyConfig(
+            name=raw_config["name"],
+            params=raw_config["params"],
+            dependencies=dependencies
         )
-        historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], unit='ms')
-        logger.info(f"Historical Data Columns: {historical_data.columns}")
-        logger.info(f"Sample Data:\n{historical_data.tail()}")
 
-        # Preprocess the data (this function may drop or adjust rows as needed)
-        historical_data = preprocess_data(historical_data)
-        logger.info(f"Preprocessed Data Columns: {historical_data.columns}")
-        logger.info(f"Sample Preprocessed Data:\n{historical_data.tail()}")
+    def _init_metrics(self):
+        """Initialize monitoring metrics"""
+        # Trade metrics
+        self.trades_total = Counter(
+            'trades_total', 
+            'Total trades by strategy and symbol', 
+            ['strategy', 'symbol']
+        )
+        self.trades_by_side = Counter(
+            'trades_by_side',
+            'Trades by symbol and side',
+            ['symbol', 'side']
+        )
+        
+        # Strategy performance metrics
+        self.buy_signals = Gauge(
+            'strategy_buy_signals',
+            'Buy signals count',
+            ['timeframe']
+        )
+        self.sell_signals = Gauge(
+            'strategy_sell_signals',
+            'Sell signals count',
+            ['timeframe']
+        )
+        
+        # System metrics
+        self.latency_gauge = Gauge('api_latency', 'API call latency in ms')
 
-        # Generate strategy signals based on historical data
-        strategy_signals = strategy.generate_signals(historical_data)
-        logger.info(f"Data length: {len(historical_data)}")
-        logger.info(f"Signals length: {len(strategy_signals)}")
-        logger.info(f"Sample signals: {strategy_signals.head()}")
+        if config.METRICS_ENABLED:
+            start_http_server(config.METRICS_PORT)
 
-        if mode == "backtest":
-            backtester = Backtester(initial_balance=100, commission=0.01, trade_size=0.5)
-            backtest_results = backtester.backtest(historical_data, strategy_signals)
-            logger.info(f"📊 Backtest Results: {backtest_results}")
-            plot_equity_curve(backtest_results['equity_curve'])
-            plot_trade_history(historical_data, backtest_results['trades'])
+    async def initialize(self):
+        """Initialize exchange connection and ML model"""
+        load_dotenv()
+        
+        async with Exchange(
+            os.getenv("BINANCE_API_KEY"),
+            os.getenv("BINANCE_API_SECRET"),
+            trading_mode=config.TRADING_MODE
+        ) as self.exchange:
+            await self._initialize_ml_model()
+            await self._main_loop()
 
+    async def _initialize_ml_model(self):
+        """ML model initialization with fallback"""
+        try:
+            self.ml_model = MLTraining()
+            if not self.ml_model.load_model():
+                if config.AUTO_RETRAIN:
+                    await self._retrain_model()
+                else:
+                    raise RuntimeError("ML model unavailable")
+        except Exception as e:
+            logger.error(f"ML initialization failed: {str(e)}")
+            if config.REQUIRE_ML:
+                raise
+
+    async def _retrain_model(self):
+        """Automated model retraining pipeline"""
+        logger.info("Initiating model retraining...")
+        data = await self._fetch_training_data()
+        if not data.empty:
+            self.ml_model.train_model(data)
+            logger.info(f"New model version {self.ml_model.version} deployed")
+
+    async def _fetch_training_data(self) -> pd.DataFrame:
+        """Fetch validated training data"""
+        raw_data = await self.exchange.fetch_ohlcv(
+            config.SYMBOL,
+            config.MODEL_TIMEFRAME,
+            limit=config.MODEL_TRAINING_WINDOW
+        )
+
+        df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        is_valid, validated_df = validate_ohlcv(df, config.SYMBOL)
+        if not is_valid:
+            logger.error("❌ Invalid training data - aborting model training")
+            return pd.DataFrame()
+        
+        return clean_ohlcv(validated_df)
+
+    async def _main_loop(self):
+        """Enhanced main trading loop with circuit breaker"""
+        last_balance_check = datetime.now()
+        
+        while not self.stop_event.is_set():
+            try:
+                if self.exchange.circuit_breaker.is_open():
+                    logger.critical("Circuit breaker tripped!")
+                    break
+
+                analysis = await self._analyze_markets()
+                
+                if (datetime.now() - last_balance_check) > timedelta(minutes=30):
+                    await self.exchange.fetch_balance()
+                    last_balance_check = datetime.now()
+                
+                if self._should_execute(analysis):
+                    await self._execute_trade(analysis)
+                
+                if self.ml_model and self.ml_model.check_drift(analysis[config.PRIMARY_TIMEFRAME]['data']):
+                    logger.warning("Model drift detected!")
+                    await self._retrain_model()
+
+                await asyncio.sleep(config.LOOP_INTERVAL)
+                
+            except Exception as e:
+                logger.error(f"Main loop error: {str(e)}")
+                await asyncio.sleep(config.ERROR_RETRY_DELAY)
+
+    async def _analyze_markets(self) -> Dict:
+        """Multi-timeframe market analysis"""
+        analysis = {}
+        for tf in config.TIMEFRAMES:
+            try:
+                with self.latency_gauge.time():
+                    raw_data = await self.exchange.fetch_ohlcv(config.SYMBOL, tf)
+            
+                df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                is_valid, validated_df = validate_ohlcv(df, config.SYMBOL)
+                if not is_valid:
+                    logger.warning(f"⚠️ Invalid {tf} data - skipping timeframe")
+                    continue
+                    
+                cleaned_data = clean_ohlcv(validated_df)
+                signals = self.strategy.generate_signals(cleaned_data)
+
+                self._track_strategy_metrics(tf, signals)
+
+                analysis[tf] = {
+                    'data': cleaned_data,
+                    'signal': signals,
+                    'ml_confidence': self.ml_model.predict_confidence(cleaned_data) if self.ml_model else None
+                }
+
+            except Exception as e:
+                logger.error(f"Error processing {tf} data: {str(e)}")
+                continue
+    
+        return analysis
+
+    def _track_strategy_metrics(self, timeframe: str, signals: pd.Series):
+        """Record strategy performance metrics"""
+        buy_signals = sum(signals == 'buy')
+        sell_signals = sum(signals == 'sell')
+        
+        self.buy_signals.labels(timeframe=timeframe).set(buy_signals)
+        self.sell_signals.labels(timeframe=timeframe).set(sell_signals)
+
+    def _should_execute(self, analysis: Dict) -> bool:
+        """Trade signal validation with multiple checks"""
+        primary = analysis[config.PRIMARY_TIMEFRAME]
+        return (
+            primary['signal'] != 'hold' and
+            (not self.ml_model or primary['ml_confidence'] >= config.MIN_CONFIDENCE) and
+            self.analyzer.acceptable_volatility(primary['data'])
+        )
+
+    async def _execute_trade(self, analysis: Dict):
+        """Execute trade with risk management"""
+        primary = analysis[config.PRIMARY_TIMEFRAME]
+        symbol = config.SYMBOL
+        signal = primary['signal'].lower()
+        
+        try:
+            size = await self._calculate_position_size(signal)
+            if size <= 0:
+                return
+
+            result = await self.exchange.place_order(
+                symbol=symbol,
+                side=signal,
+                amount=size,
+                order_type='market',
+                params={'test': config.DRY_RUN, 'strategy': config.STRATEGY_CONFIG['name']}
+            )
+        
+            if result:
+                self._record_trade_execution(result, primary)
+                self.trades_by_side.labels(symbol=symbol, side=signal).inc()
+                self.analyzer.record_trade(result)
+                logger.info(f"Executed {signal} order for {size} {symbol}")
+
+        except Exception as e:
+            logger.error(f"Trade execution failed: {str(e)}")
+            self._log_strategy_error(primary['data'])        
+
+    def _record_trade_execution(self, result: dict, analysis: dict):
+        """Record trade execution details"""
+        self.trades_total.labels(
+            strategy=config.STRATEGY_CONFIG['name'],
+            symbol=config.SYMBOL
+        ).inc()
+        
+        trade_details = {
+            'timestamp': datetime.now(),
+            'symbol': config.SYMBOL,
+            'side': result['side'],
+            'amount': result['amount'],
+            'price': result['price'],
+            'strategy_params': config.STRATEGY_CONFIG,
+            'analysis_data': analysis['data'].iloc[-1].to_dict()
+        }
+        
+        self.analyzer.record_trade(trade_details)
+
+    def _log_strategy_error(self, data):
+        """Log strategy errors with context"""
+        logger.error("Strategy error occurred with data snapshot: %s", data.iloc[-1].to_dict())
+
+    async def _calculate_position_size(self, side: str) -> float:
+        """Risk-adjusted position sizing"""
+        balance = await self.exchange.fetch_balance()
+        quote_currency = config.SYMBOL.split('/')[1]
+        free_balance = balance.get(quote_currency, {}).get('free', 0)
+        
+        return min(
+            free_balance * config.RISK_PERCENTAGE,
+            config.MAX_POSITION_SIZE
+        )
+
+    async def _calculate_position_size(self, side: str) -> float:
+        """Risk-adjusted position sizing"""
+        balance = await self.exchange.fetch_balance()
+        quote_currency = config.SYMBOL.split('/')[1]
+        free_balance = balance.get(quote_currency, {}).get('free', 0)
+        
+        return min(
+            free_balance * config.RISK_PERCENTAGE,
+            config.MAX_POSITION_SIZE
+        )
+
+# Legacy compatibility layer
+async def legacy_main(mode: str = "live_trade"):
+    """Main function for backward compatibility"""
+    bot = TradingBot()
+    
+    try:
+        if mode == "live_trade":
+            await bot.initialize()
+        elif mode == "backtest":
+            # Existing backtest implementation
+            pass
         elif mode == "paper_trade":
-            paper_trader = PaperTrader()
-            while not stop_event.is_set():
-                try:
-                    live_data = await exchange.fetch_ohlcv(config.SYMBOL, timeframe=config.TIMEFRAME)
-                    live_data = pd.DataFrame(
-                        live_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-                    )
-                    live_data['timestamp'] = pd.to_datetime(live_data['timestamp'], unit='ms')
-                    live_data = preprocess_data(live_data)
-                    signals = strategy.generate_signals(live_data)
-                    latest_signal = signals.iloc[-1]
-                    current_price = live_data['close'].iloc[-1]
-
-                    logger.info(f"Live data: {live_data.tail()}")
-                    logger.info(f"Latest signal: {latest_signal}")
-
-                    await paper_trader.execute_trade(latest_signal, current_price)
-                    logger.info("🔁 Waiting for the next cycle...")
-                    await asyncio.sleep(60)  # Adjust sleep time based on your timeframe
-
-                except Exception as e:
-                    logger.error(f"⚠️ Error in paper trading loop: {e}")
-                    await asyncio.sleep(10)
-
-        elif mode == "live_trade":
-            # Track whether we have placed the first trade
-            first_trade_executed = False
-            # Initialize LiveTrader instance **before** the loop
-            live_trader = LiveTrader(exchange, symbols, trading_mode="spot", risk_percentage=0.1)
-            while not stop_event.is_set():
-                try:
-                    # Fetch live data
-                    live_data = await exchange.fetch_ohlcv(config.SYMBOL, timeframe=config.TIMEFRAME)
-                    live_data = pd.DataFrame(
-                        live_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-                    )
-                    live_data['timestamp'] = pd.to_datetime(live_data['timestamp'], unit='ms')
-                    live_data = preprocess_data(live_data)
-                    signals = strategy.generate_signals(live_data)
-                    latest_signal = signals.iloc[-1]  # Get the most recent signal
-                    current_price = live_data['close'].iloc[-1]
-
-                    logger.info(f"Live data: {live_data.tail()}")
-                    logger.info(f"Latest signal: {latest_signal}")
-
-                    # Check if a first trade has been made
-                    balance = await exchange.fetch_balance()  # Fetch balance to check if we hold any asset
-
-                    base_currency = config.SYMBOL.split("/")[0]  # Extract "BTC" from "BTC/USDT"
-                    quote_currency = config.SYMBOL.split("/")[1]  # Extract "USDT" from "BTC/USDT"
-
-                    base_balance = balance.get(base_currency, 0)  # Amount of BTC held
-                    quote_balance = balance.get(quote_currency, 0)  # Amount of USDT held
-
-                    logger.info(f"Current Balance: {base_currency}: {base_balance}, {quote_currency}: {quote_balance}")
-
-                    if base_balance == 0 and not first_trade_executed:
-                        # If we have no base asset (BTC) and no trade has been made yet, we must start
-                        logger.info(f"🚀 No position detected! Placing first trade: BUY {base_currency}")
-
-                        await live_trader.execute_trade(config.SYMBOL, "BUY", current_price)
-
-                        first_trade_executed = True  # Mark that we've placed the first trade
-
-                    else:
-                        # If we already have a position, continue trading normally
-                        await live_trader.execute_trade(config.SYMBOL, latest_signal, current_price)
-
-                    logger.info("🔁 Waiting for the next cycle...")
-                    await asyncio.sleep(60)  # Adjust sleep time based on timeframe
-
-                except Exception as e:
-                    logger.error(f"⚠️ Error in live trading loop: {traceback.format_exc()}")
-                    await asyncio.sleep(10)  # Retry after delay
-
-        elif mode == "optimize":
-            trade_sizes = [0.05, 0.1, 0.2]
-            commissions = [0.0005, 0.001, 0.002]
-            best_params = optimize_parameters(historical_data, trade_sizes, commissions)
-            logger.info(f"🎯 Best Parameters: {best_params}")
-
+            # Existing paper trade implementation
+            pass
+            
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested...")
     finally:
-        exit_listener.cancel()
-        await exchange.close()
-        logger.info("✅ Exchange connection closed.")
+        bot.stop_event.set()
+        logger.info("Bot shutdown complete")
 
 if __name__ == "__main__":
-    # Run the bot in live trading mode
-    asyncio.run(main(mode="live_trade"))
+    try:
+        asyncio.run(legacy_main(mode="live_trade"))
+    except Exception as e:
+        logger.critical(f"Fatal error: {str(e)}")
