@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging
 import inspect
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Type, Dict, Any, Optional, ClassVar,
     Protocol, runtime_checkable, Generic, TypeVar
@@ -56,15 +56,15 @@ class StrategyParameters(BaseModel):
     class Config:
         extra = 'forbid'
         validate_assignment = True
-        arbitrary_types_allowed = True
+
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    """Immutable strategy configuration container"""
-    name: str
-    version: str = "1.0.0"
-    parameters: StrategyParameters
-    dependencies: Dict[str, StrategyConfig] = None
+    """Correct field ordering for dataclass"""
+    name: str                   # Required field (no default)
+    parameters: StrategyParameters  # Required field (no default)
+    version: str = "1.0.0"      # Optional field (has default)
+    dependencies: Dict[str, 'StrategyConfig'] = field(default_factory=dict)
     enabled: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
