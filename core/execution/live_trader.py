@@ -1,7 +1,7 @@
 import logging
 import asyncio
-from exchange import Exchange
-from utils.notifications import send_telegram_message_with_retries
+from core.execution.exchange import Exchange
+from utilities.notifications import send_telegram_message_with_retries
 
 logger = logging.getLogger(__name__)
 

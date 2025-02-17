@@ -3,6 +3,7 @@ import pandas as pd
 import joblib
 import logging
 import os
+import json
 import time
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestClassifier
@@ -11,8 +12,8 @@ from sklearn.metrics import accuracy_score, classification_report, precision_rec
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.pipeline import Pipeline
 from scipy.stats import randint
-from exchange import Exchange  # Your exchange class
-from ml_models.feature_engineering import preprocess_data
+from core.execution.exchange import Exchange  # Your exchange class
+from ml.features.feature_engineering import preprocess_data
 
 # Configure logger
 logging.basicConfig(
