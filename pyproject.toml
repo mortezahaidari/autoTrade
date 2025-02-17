@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autotrade"
+version = "0.1.0"
+dependencies = [
+    "ccxt>=4.1.59",
+    "pydantic>=2.5",
+    "structlog>=23.1.0",
+    "pandas>=2.0"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "mypy>=1.0"]

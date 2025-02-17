@@ -56,7 +56,8 @@ API_RATE_LIMIT = 10  # requests per second
 DRY_RUN = True  # test mode without real orders
 
 
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
+
 
 class Settings(BaseSettings):
     STRATEGY: str = "bollinger_bands"

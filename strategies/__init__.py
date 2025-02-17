@@ -1,23 +1,17 @@
 # Initialize strategies package
-from .base_strategy import BaseStrategy
-from .strategy_factory import StrategyFactory, StrategyConfig
-from strategies.trend import (
-    BollingerBandsStrategy,
-    MACrossoverStrategy
-)
-from strategies.mean_reversion import (
-    RSIStrategy,
-    StochasticOscillatorStrategy
-)
-from strategies.trend import BollingerBandsStrategy  # Add this
-from .mean_reversion.rsi import RSIStrategy  # Add this
+from strategies.base_strategy import BaseStrategy
+from strategies.strategy_factory import StrategyFactory, StrategyConfig
+from strategies.trend.moving_average_crossover import  MovingAverageCrossoverStrategy
+from strategies.trend.bollinger_band import BollingerBandsStrategy 
+from strategies.mean_reversion.rsi import RSIStrategy
+from strategies.mean_reversion.stochastic_oscillator import StochasticOscillatorStrategy
 
 __all__ = [
     'BaseStrategy',
     'StrategyFactory',
     'StrategyConfig',
     'BollingerBandsStrategy',
-    'MACrossoverStrategy',
+    'MovingAverageCrossoverStrategy',
     'RSIStrategy',
     'StochasticOscillatorStrategy'
 ]

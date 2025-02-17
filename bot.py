@@ -6,18 +6,18 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from typing import Dict, Optional, Any
 
-from exchange import Exchange
+from core.execution.exchange import Exchange
 from strategies.strategy_factory import StrategyFactory, StrategyConfig  # Added StrategyConfig import
-from live_trading.live_trader import LiveTrader
-import config
-from ml_models.model_training import MLTraining
+from core.execution.live_trader import LiveTrader
+from core.analysis.metrics import TradeAnalyzer
+from ml.models.model_training import MLTraining
 import joblib
-from utils.performance import TradeAnalyzer
+from core.config import settings
 
 # Enhanced imports
 from prometheus_client import start_http_server, Counter, Gauge
-from utils.performance import TradeAnalyzer
-from utils.data_quality import validate_ohlcv, clean_ohlcv
+#from core.utilities.performance import TradeAnalyzer
+from core.utilities.data_quality import validate_ohlcv, clean_ohlcv
 
 # Configure logging
 logging.basicConfig(
@@ -52,7 +52,7 @@ class TradingBot:
 
     def _load_strategy_config(self) -> StrategyConfig:
         """Convert config dict to StrategyConfig with validation"""
-        raw_config = config.STRATEGY_CONFIG
+        raw_config = settings.STRATEGY_CONFIG
         
         dependencies = {}
         for dep_name, dep_config in raw_config.get("dependencies", {}).items():
@@ -96,8 +96,8 @@ class TradingBot:
         # System metrics
         self.latency_gauge = Gauge('api_latency', 'API call latency in ms')
 
-        if config.METRICS_ENABLED:
-            start_http_server(config.METRICS_PORT)
+        if settings.METRICS_ENABLED:
+            start_http_server(settings.METRICS_PORT)
 
     async def initialize(self):
         """Initialize exchange connection and ML model"""
@@ -106,7 +106,7 @@ class TradingBot:
         async with Exchange(
             os.getenv("BINANCE_API_KEY"),
             os.getenv("BINANCE_API_SECRET"),
-            trading_mode=config.TRADING_MODE
+            trading_mode=settings.TRADING_MODE
         ) as self.exchange:
             await self._initialize_ml_model()
             await self._main_loop()
@@ -116,13 +116,13 @@ class TradingBot:
         try:
             self.ml_model = MLTraining()
             if not self.ml_model.load_model():
-                if config.AUTO_RETRAIN:
+                if settings.AUTO_RETRAIN:
                     await self._retrain_model()
                 else:
                     raise RuntimeError("ML model unavailable")
         except Exception as e:
             logger.error(f"ML initialization failed: {str(e)}")
-            if config.REQUIRE_ML:
+            if settings.REQUIRE_ML:
                 raise
 
     async def _retrain_model(self):
@@ -136,13 +136,13 @@ class TradingBot:
     async def _fetch_training_data(self) -> pd.DataFrame:
         """Fetch validated training data"""
         raw_data = await self.exchange.fetch_ohlcv(
-            config.SYMBOL,
-            config.MODEL_TIMEFRAME,
-            limit=config.MODEL_TRAINING_WINDOW
+            settings.SYMBOL,
+            settings.MODEL_TIMEFRAME,
+            limit=settings.MODEL_TRAINING_WINDOW
         )
 
         df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        is_valid, validated_df = validate_ohlcv(df, config.SYMBOL)
+        is_valid, validated_df = validate_ohlcv(df, settings.SYMBOL)
         if not is_valid:
             logger.error("❌ Invalid training data - aborting model training")
             return pd.DataFrame()
@@ -168,26 +168,26 @@ class TradingBot:
                 if self._should_execute(analysis):
                     await self._execute_trade(analysis)
                 
-                if self.ml_model and self.ml_model.check_drift(analysis[config.PRIMARY_TIMEFRAME]['data']):
+                if self.ml_model and self.ml_model.check_drift(analysis[settings.PRIMARY_TIMEFRAME]['data']):
                     logger.warning("Model drift detected!")
                     await self._retrain_model()
 
-                await asyncio.sleep(config.LOOP_INTERVAL)
+                await asyncio.sleep(settings.LOOP_INTERVAL)
                 
             except Exception as e:
                 logger.error(f"Main loop error: {str(e)}")
-                await asyncio.sleep(config.ERROR_RETRY_DELAY)
+                await asyncio.sleep(settings.ERROR_RETRY_DELAY)
 
     async def _analyze_markets(self) -> Dict:
         """Multi-timeframe market analysis"""
         analysis = {}
-        for tf in config.TIMEFRAMES:
+        for tf in settings.TIMEFRAMES:
             try:
                 with self.latency_gauge.time():
-                    raw_data = await self.exchange.fetch_ohlcv(config.SYMBOL, tf)
+                    raw_data = await self.exchange.fetch_ohlcv(settings.SYMBOL, tf)
             
                 df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                is_valid, validated_df = validate_ohlcv(df, config.SYMBOL)
+                is_valid, validated_df = validate_ohlcv(df, settings.SYMBOL)
                 if not is_valid:
                     logger.warning(f"⚠️ Invalid {tf} data - skipping timeframe")
                     continue
@@ -219,17 +219,17 @@ class TradingBot:
 
     def _should_execute(self, analysis: Dict) -> bool:
         """Trade signal validation with multiple checks"""
-        primary = analysis[config.PRIMARY_TIMEFRAME]
+        primary = analysis[settings.PRIMARY_TIMEFRAME]
         return (
             primary['signal'] != 'hold' and
-            (not self.ml_model or primary['ml_confidence'] >= config.MIN_CONFIDENCE) and
+            (not self.ml_model or primary['ml_confidence'] >= settings.MIN_CONFIDENCE) and
             self.analyzer.acceptable_volatility(primary['data'])
         )
 
     async def _execute_trade(self, analysis: Dict):
         """Execute trade with risk management"""
-        primary = analysis[config.PRIMARY_TIMEFRAME]
-        symbol = config.SYMBOL
+        primary = analysis[settings.PRIMARY_TIMEFRAME]
+        symbol = settings.SYMBOL
         signal = primary['signal'].lower()
         
         try:
@@ -242,7 +242,7 @@ class TradingBot:
                 side=signal,
                 amount=size,
                 order_type='market',
-                params={'test': config.DRY_RUN, 'strategy': config.STRATEGY_CONFIG['name']}
+                params={'test': settings.DRY_RUN, 'strategy': settings.STRATEGY_CONFIG['name']}
             )
         
             if result:
@@ -258,17 +258,17 @@ class TradingBot:
     def _record_trade_execution(self, result: dict, analysis: dict):
         """Record trade execution details"""
         self.trades_total.labels(
-            strategy=config.STRATEGY_CONFIG['name'],
-            symbol=config.SYMBOL
+            strategy=settings.STRATEGY_CONFIG['name'],
+            symbol=settings.SYMBOL
         ).inc()
         
         trade_details = {
             'timestamp': datetime.now(),
-            'symbol': config.SYMBOL,
+            'symbol': settings.SYMBOL,
             'side': result['side'],
             'amount': result['amount'],
             'price': result['price'],
-            'strategy_params': config.STRATEGY_CONFIG,
+            'strategy_params': settings.STRATEGY_CONFIG,
             'analysis_data': analysis['data'].iloc[-1].to_dict()
         }
         
@@ -281,23 +281,23 @@ class TradingBot:
     async def _calculate_position_size(self, side: str) -> float:
         """Risk-adjusted position sizing"""
         balance = await self.exchange.fetch_balance()
-        quote_currency = config.SYMBOL.split('/')[1]
+        quote_currency = settings.SYMBOL.split('/')[1]
         free_balance = balance.get(quote_currency, {}).get('free', 0)
         
         return min(
-            free_balance * config.RISK_PERCENTAGE,
-            config.MAX_POSITION_SIZE
+            free_balance * settings.RISK_PERCENTAGE,
+            settings.MAX_POSITION_SIZE
         )
 
     async def _calculate_position_size(self, side: str) -> float:
         """Risk-adjusted position sizing"""
         balance = await self.exchange.fetch_balance()
-        quote_currency = config.SYMBOL.split('/')[1]
+        quote_currency = settings.SYMBOL.split('/')[1]
         free_balance = balance.get(quote_currency, {}).get('free', 0)
         
         return min(
-            free_balance * config.RISK_PERCENTAGE,
-            config.MAX_POSITION_SIZE
+            free_balance * settings.RISK_PERCENTAGE,
+            settings.MAX_POSITION_SIZE
         )
 
 # Legacy compatibility layer
