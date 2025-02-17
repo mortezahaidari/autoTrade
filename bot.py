@@ -7,16 +7,16 @@ from dotenv import load_dotenv
 from typing import Dict, Optional, Any
 
 from core.execution.exchange import Exchange
-from strategies.strategy_factory import StrategyFactory, StrategyConfig  # Added StrategyConfig import
+from strategies.strategy_factory import StrategyFactory, StrategyConfig, StrategyParameters  # Added StrategyConfig import
 from core.execution.live_trader import LiveTrader
 from core.analysis.metrics import TradeAnalyzer
 from ml.models.model_training import MLTraining
 import joblib
 from core.config import settings
 
+
 # Enhanced imports
 from prometheus_client import start_http_server, Counter, Gauge
-#from core.utilities.performance import TradeAnalyzer
 from core.utilities.data_quality import validate_ohlcv, clean_ohlcv
 
 # Configure logging
@@ -41,6 +41,52 @@ class TradingBot:
         self.strategy = self._create_strategy()  # Use validated strategy creation
         self._init_metrics()
 
+
+    def _load_strategy_config(self) -> StrategyConfig:
+        raw_config = settings.STRATEGY_CONFIG
+        
+        dependencies = {}
+        for dep_name, dep_config in raw_config.get("dependencies", {}).items():
+            # Get proper parameters class for each dependency
+            strategy_class, param_model = StrategyFactory.get_strategy_type(
+                dep_config["name"], 
+                dep_config.get("version", "1.0.0")
+            )
+            dependencies[dep_name] = StrategyConfig(
+                name=dep_config["name"],
+                parameters=param_model(**dep_config["parameters"]),
+                version=dep_config.get("version", "1.0.0")
+            )
+        
+        # Get main strategy parameters class
+        main_strategy_class, main_param_model = StrategyFactory.get_strategy_type(
+            raw_config["name"],
+            raw_config.get("version", "1.0.0")
+        )
+        
+        return StrategyConfig(
+            name=raw_config["name"],
+            parameters=main_param_model(**raw_config["parameters"]),
+            dependencies=dependencies,
+            version=raw_config.get("version", "1.0.0")
+        )
+
+    
+    
+    
+    def _validate_dependencies(self, deps: Dict[str, StrategyConfig]) -> Dict[str, StrategyConfig]:
+        """ Validate enabled status and configuration of strategy dependencies """
+        if not deps:
+            return deps
+        for dep_name, config in deps.items():
+            if not config.enabled:
+                raise ValueError(f"Dependency strategy '{dep_name}' is disabled")
+            if not StrategyFactory.is_strategy_registered(config.name, config.version):
+                raise ValueError(f"Unregistered dependenciy: {config.name}@{config.version}")
+            
+        return deps    
+
+
     def _create_strategy(self) -> Any:
         """Create strategy instance with validation"""
         try:
@@ -50,22 +96,7 @@ class TradingBot:
             logger.critical(f"Strategy creation failed: {e}")
             raise SystemExit(1) from e
 
-    def _load_strategy_config(self) -> StrategyConfig:
-        """Convert config dict to StrategyConfig with validation"""
-        raw_config = settings.STRATEGY_CONFIG
-        
-        dependencies = {}
-        for dep_name, dep_config in raw_config.get("dependencies", {}).items():
-            dependencies[dep_name] = StrategyConfig(
-                name=dep_config["name"],
-                params=dep_config["params"]
-            )
-        
-        return StrategyConfig(
-            name=raw_config["name"],
-            params=raw_config["params"],
-            dependencies=dependencies
-        )
+
 
     def _init_metrics(self):
         """Initialize monitoring metrics"""
@@ -101,6 +132,11 @@ class TradingBot:
 
     async def initialize(self):
         """Initialize exchange connection and ML model"""
+
+        # Add strategy registration check
+        if not StrategyFactory.is_strategy_registered("atr_filter", "1.2.0"):
+            raise RuntimeError("ATR Filter strategy not registered")
+        
         load_dotenv()
         
         async with Exchange(
@@ -188,6 +224,10 @@ class TradingBot:
             
                 df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 is_valid, validated_df = validate_ohlcv(df, settings.SYMBOL)
+                if df.empty:
+                    logger.warning(f"No data for {tf}")
+                    continue
+
                 if not is_valid:
                     logger.warning(f"⚠️ Invalid {tf} data - skipping timeframe")
                     continue
@@ -209,10 +249,10 @@ class TradingBot:
     
         return analysis
 
-    def _track_strategy_metrics(self, timeframe: str, signals: pd.Series):
+    def _track_strategy_metrics(self, timeframe: str, signals: pd.Series) -> None:
         """Record strategy performance metrics"""
-        buy_signals = sum(signals == 'buy')
-        sell_signals = sum(signals == 'sell')
+        buy_signals = sum(signals == 'buy') if signals is not None else 0
+        sell_signals = sum(signals == 'sell') if signals is not None else 0
         
         self.buy_signals.labels(timeframe=timeframe).set(buy_signals)
         self.sell_signals.labels(timeframe=timeframe).set(sell_signals)
@@ -252,7 +292,7 @@ class TradingBot:
                 logger.info(f"Executed {signal} order for {size} {symbol}")
 
         except Exception as e:
-            logger.error(f"Trade execution failed: {str(e)}")
+            logger.error(f"Trade execution failed: {str(e)}", exc_info=True) # added stacktrace
             self._log_strategy_error(primary['data'])        
 
     def _record_trade_execution(self, result: dict, analysis: dict):
@@ -278,16 +318,6 @@ class TradingBot:
         """Log strategy errors with context"""
         logger.error("Strategy error occurred with data snapshot: %s", data.iloc[-1].to_dict())
 
-    async def _calculate_position_size(self, side: str) -> float:
-        """Risk-adjusted position sizing"""
-        balance = await self.exchange.fetch_balance()
-        quote_currency = settings.SYMBOL.split('/')[1]
-        free_balance = balance.get(quote_currency, {}).get('free', 0)
-        
-        return min(
-            free_balance * settings.RISK_PERCENTAGE,
-            settings.MAX_POSITION_SIZE
-        )
 
     async def _calculate_position_size(self, side: str) -> float:
         """Risk-adjusted position sizing"""

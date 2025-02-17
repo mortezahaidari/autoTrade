@@ -15,19 +15,22 @@ STRATEGY_PARAMS = {
     'bollinger_period': 20
 }
 
+# In core/config/settings.py
 STRATEGY_CONFIG = {
-    "name": "combined",
-    "params": {
-        "threshold": 0.7
+    "name": "bollinger_bands",
+    "version": "2.1.0",
+    "parameters": {
+        "window": 20,
+        "num_std": 2.0
     },
     "dependencies": {
-        "trend": {
-            "name": "moving_average_crossover",
-            "params": {"short_window": 50, "long_window": 200}
-        },
-        "momentum": {
-            "name": "rsi", 
-            "params": {"period": 14}
+        "volatility_filter": {
+            "name": "atr_filter",
+            "version": "1.2.0",
+            "parameters": {
+                "period": 14,
+                "threshold": 1.5
+            }
         }
     }
 }

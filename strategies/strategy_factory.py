@@ -4,15 +4,16 @@ import inspect
 import threading
 from dataclasses import dataclass, field
 from typing import (
-    Type, Dict, Any, Optional, ClassVar,
+    Type, Dict, Any, Optional, ClassVar, Tuple,
     Protocol, runtime_checkable, Generic, TypeVar
 )
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, Field
 from functools import lru_cache
 import importlib.util
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
 
 # --------------------------
 # Protocol Definitions
@@ -57,6 +58,16 @@ class StrategyParameters(BaseModel):
         extra = 'forbid'
         validate_assignment = True
 
+class BollingerBandsParameters(StrategyParameters):
+    """Bollinger Bands specific parameters"""
+    window: int = Field(20, gt=5, le=100)
+    num_std: float = Field(2.0, gt=1.0, le=3.0)
+
+class ATRFilterParameters(StrategyParameters):
+    """ATR Filter specific parameters"""
+    period: int = Field(14, gt=5, le=50)
+    threshold: float = Field(1.5, ge=0.5, le=5.0)            
+
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -80,19 +91,26 @@ class StrategyConfig:
 # Strategy Factory Implementation
 # --------------------------
 class StrategyFactory(Generic[T]):
-    """Advanced strategy factory with plugin support and validation"""
+    """Advanced strategy factory with parameter model support"""
     
-    _registry: ClassVar[Dict[str, Type[T]]] = {}
+    _registry: ClassVar[Dict[str, Tuple[Type[T], Type[StrategyParameters]]]] = {}
     _lock: ClassVar[threading.Lock] = threading.Lock()
     _cache_size: ClassVar[int] = 100
+
+    @classmethod
+    def is_strategy_registered(cls, name: str, version: str) -> bool:
+        """Check if a strategy is registered with the factory"""
+        key = f"{name}@{version}"
+        with cls._lock:
+            return key in cls._registry
 
     @classmethod
     @lru_cache(maxsize=_cache_size)
     def create(cls, config: StrategyConfig) -> T:
         """Create strategy instance with caching and validation"""
         try:
-            strategy_class = cls._resolve_strategy_class(config.name, config.version)
-            validated_params = cls._validate_parameters(strategy_class, config.parameters)
+            strategy_class, param_model = cls._resolve_strategy_class(config.name, config.version)
+            validated_params = cls._validate_parameters(param_model, config.parameters)
             dependencies = cls._resolve_dependencies(config.dependencies)
             
             return strategy_class(
@@ -100,32 +118,54 @@ class StrategyFactory(Generic[T]):
                 **dependencies
             )
         except ValidationError as ve:
-            logger.error(f"Parameter validation failed: {ve.json()}")
+            logger.error(f"Parameter validation failed: {ve}")
             raise InvalidParameterError(f"Invalid parameters for {config.name}") from ve
-        except Exception as exc:
-            logger.error(f"Strategy creation failed for {config.name}", exc_info=True)
-            raise StrategyCreationError(f"Failed to create {config.name}") from exc
 
     @classmethod
-    def _resolve_strategy_class(cls, name: str, version: str) -> Type[T]:
-        """Resolve strategy class with version checking"""
-        with cls._lock:
-            strategy_class = cls._registry.get(f"{name}@{version}")
-            if not strategy_class:
-                raise StrategyError(f"Strategy {name} version {version} not registered")
-            
-            if not issubclass(strategy_class, TradingStrategy):
-                raise TypeError(f"{strategy_class.__name__} doesn't implement TradingStrategy protocol")
-            
-            return strategy_class
+    def get_strategy_type(cls, name: str, version: str) -> Tuple[Type[T], Type[StrategyParameters]]:
+        """Get strategy class and its parameter model"""
+        key = f"{name}@{version}"
+        if key not in cls._registry:
+            raise StrategyError(f"Strategy {key} not registered")
+        return cls._registry[key]
 
     @classmethod
-    def _validate_parameters(cls, strategy_class: Type[T], params: StrategyParameters) -> StrategyParameters:
-        """Validate parameters against strategy requirements"""
-        if not issubclass(strategy_class, ParameterizedStrategy):
-            return params
+    def register(cls, name: str, version: str = "1.0.0"):
+        """Decorator for strategy registration"""
+        def decorator(strategy_class: Type[T]):
+            # Auto-detect parameter model
+            param_model = getattr(strategy_class, 'Parameters', StrategyParameters)
+            
+            with cls._lock:
+                key = f"{name}@{version}"
+                if key in cls._registry:
+                    raise ValueError(f"Strategy {key} already registered")
+                
+                if not issubclass(param_model, StrategyParameters):
+                    raise TypeError("Parameter model must inherit from StrategyParameters")
+                
+                cls._registry[key] = (strategy_class, param_model)
+                logger.info(f"Registered strategy: {key}")
+                return strategy_class
+            return decorator
+
+    @classmethod
+    def _resolve_strategy_class(cls, name: str, version: str) -> Tuple[Type[T], Type[StrategyParameters]]:
+        """Resolve strategy class and its parameter model"""
+        key = f"{name}@{version}"
+        if key not in cls._registry:
+            raise StrategyError(f"Strategy {key} not registered")
         
-        param_model = strategy_class.parameter_model()
+        strategy_class, param_model = cls._registry[key]
+        
+        if not issubclass(strategy_class, TradingStrategy):
+            raise TypeError(f"{strategy_class.__name__} doesn't implement TradingStrategy protocol")
+        
+        return strategy_class, param_model
+
+    @classmethod
+    def _validate_parameters(cls, param_model: Type[StrategyParameters], params: StrategyParameters) -> StrategyParameters:
+        """Validate parameters against strategy requirements"""
         return param_model(**params.dict())
 
     @classmethod
@@ -143,23 +183,6 @@ class StrategyFactory(Generic[T]):
             
             resolved[dep_name] = dep_instance
         return resolved
-
-    @classmethod
-    def register(cls, name: str, version: str = "1.0.0"):
-        """Decorator for strategy registration with versioning"""
-        def decorator(strategy_class: Type[T]):
-            with cls._lock:
-                full_name = f"{name}@{version}"
-                if full_name in cls._registry:
-                    raise ValueError(f"Strategy {full_name} already registered")
-                
-                if not inspect.isclass(strategy_class) or not issubclass(strategy_class, TradingStrategy):
-                    raise TypeError("Registered class must implement TradingStrategy protocol")
-                
-                cls._registry[full_name] = strategy_class
-                logger.info(f"Registered strategy: {full_name}")
-                return strategy_class
-            return decorator
 
     @classmethod
     def discover_strategies(cls, plugin_dir: Path):
@@ -199,3 +222,4 @@ class BaseStrategy(TradingStrategy, ParameterizedStrategy):
 
     def get_parameters(self) -> Dict[str, Any]:
         return {field: getattr(self, field) for field in self.required_parameters()}
+    
