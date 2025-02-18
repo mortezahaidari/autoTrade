@@ -132,6 +132,7 @@ class TradingBot:
 
     async def initialize(self):
         """Initialize exchange connection and ML model"""
+        self._validate_strategy_dependencies()
 
         # Add strategy registration check
         if not StrategyFactory.is_strategy_registered("atr_filter", "1.2.0"):
@@ -147,8 +148,22 @@ class TradingBot:
             await self._initialize_ml_model()
             await self._main_loop()
 
+    def _validate_strategy_dependencies(self):
+        """Ensure all required strategies are registered"""
+        required = [
+            (cfg['name'], cfg.get('version', '1.0.0'))
+            for cfg in settings.STRATEGY_CONFIG.get('dependencies', {}).values()
+        ]
+        
+        for name, version in required:
+            if not StrategyFactory.is_strategy_registered(name, version):
+                raise RuntimeError(f"Unregistered dependency: {name}@{version}")        
+
     async def _initialize_ml_model(self):
         """ML model initialization with fallback"""
+        if self.ml_model and self.ml_model.is_loaded:
+            return # Skip reinitialization
+        
         try:
             self.ml_model = MLTraining()
             if not self.ml_model.load_model():

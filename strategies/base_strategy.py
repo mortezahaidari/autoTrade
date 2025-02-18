@@ -1,17 +1,11 @@
-from abc import ABC, abstractmethod
-import pandas as pd
+from core.protocols import TradingStrategy, ParameterizedStrategy
 
-class BaseStrategy(ABC):
-    @abstractmethod
-    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
-        """Generate trading signals from OHLCV data"""
-        pass
-
-    @property
-    @abstractmethod
-    def params(self) -> dict:
-        """Return strategy parameters"""
-        pass
-
-    def version(self) -> str:
-        return "1.0"
+class BaseStrategy(TradingStrategy, ParameterizedStrategy):
+    """Abstract base class for all strategies"""
+    
+    @classmethod
+    def required_parameters(cls) -> dict:
+        return {}
+    
+    def get_parameters(self) -> dict:
+        return {k: getattr(self, k) for k in self.required_parameters()}

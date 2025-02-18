@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError, Field
 from functools import lru_cache
 import importlib.util
 from pathlib import Path
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class StrategyParameters(BaseModel):
     class Config:
         extra = 'forbid'
         validate_assignment = True
+        frozen = True # makes instances hashable
 
 class BollingerBandsParameters(StrategyParameters):
     """Bollinger Bands specific parameters"""
@@ -86,6 +88,16 @@ class StrategyConfig:
             'dependencies': {k: v.to_dict() for k, v in (self.dependencies or {}).items()},
             'enabled': self.enabled
         }
+    
+    def to_json(self) -> str:
+        """Serialize config to JSON string for caching"""
+        return json.dumps({
+            'name': self.name,
+            'version': self.version,
+            'parameters': self.parameters.dict(),
+            'dependencies': {k: v.to_dict() for k, v in self.dependencies.items()},
+            'enabled': self.enabled
+        }, sort_keys=True)    
 
 # --------------------------
 # Strategy Factory Implementation
@@ -106,17 +118,24 @@ class StrategyFactory(Generic[T]):
 
     @classmethod
     @lru_cache(maxsize=_cache_size)
-    def create(cls, config: StrategyConfig) -> T:
-        """Create strategy instance with caching and validation"""
+    def create_strategy(cls, config_json: str) -> T:
+        """Create strategy instance with JSON-serialized config"""
+        
         try:
+            config = StrategyConfig(**json.loads(config_json))
             strategy_class, param_model = cls._resolve_strategy_class(config.name, config.version)
-            validated_params = cls._validate_parameters(param_model, config.parameters)
+            validated_params = param_model(**config.parameters.dict())
             dependencies = cls._resolve_dependencies(config.dependencies)
             
             return strategy_class(
                 **validated_params.dict(),
                 **dependencies
             )
+        
+        except json.JSONDecodeError as je:
+            logger.error(f"Invalid config JSON: {je}")
+            raise StrategyCreationError("Invalid configuration format") from je
+        
         except ValidationError as ve:
             logger.error(f"Parameter validation failed: {ve}")
             raise InvalidParameterError(f"Invalid parameters for {config.name}") from ve
@@ -147,7 +166,7 @@ class StrategyFactory(Generic[T]):
                 cls._registry[key] = (strategy_class, param_model)
                 logger.info(f"Registered strategy: {key}")
                 return strategy_class
-            return decorator
+        return decorator
 
     @classmethod
     def _resolve_strategy_class(cls, name: str, version: str) -> Tuple[Type[T], Type[StrategyParameters]]:
