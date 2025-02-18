@@ -14,16 +14,18 @@ class BollingerBandsStrategy(BaseStrategy):
         window: int = Field(20, gt=5, le=100, description="Rolling window size for moving average.")
         num_std: float = Field(2.0, gt=1.0, le=3.0, description="Number of standard deviations for bands.")
 
-    def __init__(self, window=20, num_std=2.0):
+    def __init__(self, window=20, num_std=2.0, volatility_filter=None):
         """
         Initializes the Bollinger Bands strategy with specified parameters.
 
         Args:
             window (int): Moving average window size.
             num_std (float): Number of standard deviations for upper/lower bands.
+            volatility_filter: Optional dependency strategy (e.g. ATR Filter)
         """
         self.window = window
         self.num_std = num_std
+        self.volatility_filter = volatility_filter
 
     def generate_signals(self, data: pd.DataFrame) -> pd.Series:
         """

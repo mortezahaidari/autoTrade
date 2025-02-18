@@ -83,9 +83,10 @@ class CircuitBreaker:
 class BaseExchange:
     """Core exchange functionality with safety features"""
     
-    def __init__(self, api_key: str, api_secret: str, config: ExchangeConfig = ExchangeConfig()):
+    def __init__(self, api_key: str, api_secret: str, trading_mode: str = "spot", config: ExchangeConfig = ExchangeConfig()):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.trading_mode = trading_mode  # Accept trading_mode parameter
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
         self.exchange: Optional[ccxt.Exchange] = None
@@ -112,7 +113,10 @@ class BaseExchange:
             "secret": self.api_secret,
             "enableRateLimit": True,
             "session": self.session,
-            'options': {'adjustForTimeDifference': False},
+            'options': {
+                'adjustForTimeDifference': False,
+                'defaultType': self.trading_mode,  # Use trading_mode here
+            },
         })
         await self.sync_time(force=True)
 
@@ -255,10 +259,14 @@ class Exchange(AdvancedExchange):
     
     async def place_market_order(self, symbol: str, side: str, amount: float) -> dict:
         """Legacy market order interface"""
+        if self.exchange is None:
+            raise ExchangeError("Exchange instance is not available (closed)")
         return await self.place_order(symbol, side, amount, 'market')
 
     async def place_margin_order(self, symbol: str, side: str, amount: float) -> dict:
         """Legacy margin order interface"""
+        if self.exchange is None:
+            raise ExchangeError("Exchange instance is not available (closed)")
         return await self.place_order(
             symbol, side, amount, 'market', 
             {'marginMode': 'cross'}

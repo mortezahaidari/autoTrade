@@ -1,21 +1,14 @@
-# config.py
+from pydantic_settings import BaseSettings
 
-# Core Trading Configuration
-SYMBOL = "BTC/USDT"
-TRADING_MODE = "spot"  # spot or margin
-PRIMARY_TIMEFRAME = "4h"
-TIMEFRAMES = ["15m", "1h", "4h"]
+class Settings(BaseSettings):
+    STRATEGY: str = "bollinger_bands"
+    RISK_PCT: float = 0.02
+    MAX_LEVERAGE: int = 10
+    
+    class Config:
+        env_file = ".env"
 
-# Strategy Configuration
-STRATEGY_NAME = "combined"
-STRATEGY_PARAMS = {
-    'rsi_period': 14,
-    'ema_short': 20,
-    'ema_long': 50,
-    'bollinger_period': 20
-}
-
-# In core/config/settings.py
+# Define your strategy configuration here (instead of as an attribute on StrategyConfig)
 STRATEGY_CONFIG = {
     "name": "bollinger_bands",
     "version": "2.1.0",
@@ -35,37 +28,36 @@ STRATEGY_CONFIG = {
     }
 }
 
+""" Configuration Validation"""
+from strategies.strategy_factory import StrategyFactory, StrategyConfig
+from strategies.strategy_factory import BollingerBandsParameters, ATRFilterParameters
 
-# Risk Management
-RISK_PERCENTAGE = 0.02
-MAX_POSITION_SIZE = 0.1
-STOP_LOSS_PCT = 0.05
-TAKE_PROFIT_PCT = 0.10
+# Use the global STRATEGY_CONFIG variable
+if not StrategyFactory.is_strategy_registered(
+    STRATEGY_CONFIG['dependencies']['volatility_filter']['name'],
+    STRATEGY_CONFIG['dependencies']['volatility_filter']['version']
+):
+    raise RuntimeError("Dependency strategy 'atr_filter' not registered")
 
-# Machine Learning
-MODEL_TIMEFRAME = "4h"
-MODEL_TRAINING_WINDOW = 1000
-AUTO_RETRAIN = True
-REQUIRE_ML = False
+# Create the dependency strategy (atr_filter in this case)
+volatility_filter_config = StrategyConfig(
+    name="atr_filter",  # Name of the dependency strategy
+    version="1.2.0",    # Version
+    parameters=ATRFilterParameters(period=14, threshold=1.5),  # Parameters for atr_filter
+)
+volatility_filter = StrategyFactory.create_strategy(volatility_filter_config)
 
-# Monitoring & Metrics
-METRICS_ENABLED = True
-METRICS_PORT = 9100
-LOOP_INTERVAL = 60  # seconds
-ERROR_RETRY_DELAY = 10
+# Create the main strategy (bollinger_bands in this case)
+bollinger_bands_config = StrategyConfig(
+    name="bollinger_bands",  # Main strategy
+    version="2.1.0",         # Version
+    parameters=BollingerBandsParameters(window=20, num_std=2.0),  # Parameters for bollinger_bands
+    dependencies={
+        "volatility_filter": volatility_filter_config  # Attach the created dependency here
+    }
+)
+bollinger_bands_strategy = StrategyFactory.create_strategy(bollinger_bands_config)
 
-# Exchange Settings
-API_RATE_LIMIT = 10  # requests per second
-DRY_RUN = True  # test mode without real orders
-
-
-from pydantic_settings import BaseSettings
-
-
-class Settings(BaseSettings):
-    STRATEGY: str = "bollinger_bands"
-    RISK_PCT: float = 0.02
-    MAX_LEVERAGE: int = 10
-    
-    class Config:
-        env_file = ".env"
+# Now you can use the created strategy instances
+signals = bollinger_bands_strategy.generate_signals(data)
+print(f"Generated signals: {signals}")

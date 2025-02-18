@@ -12,6 +12,7 @@ from functools import lru_cache
 import importlib.util
 from pathlib import Path
 import json
+from frozendict import frozendict
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ class StrategyParameters(BaseModel):
     class Config:
         extra = 'forbid'
         validate_assignment = True
-        frozen = True # makes instances hashable
+        frozen = True  # makes instances hashable
 
 class BollingerBandsParameters(StrategyParameters):
     """Bollinger Bands specific parameters"""
@@ -70,15 +71,21 @@ class ATRFilterParameters(StrategyParameters):
     period: int = Field(14, gt=5, le=50)
     threshold: float = Field(1.5, ge=0.5, le=5.0)            
 
-
 @dataclass(frozen=True)
 class StrategyConfig:
-    """Correct field ordering for dataclass"""
-    name: str                   # Required field (no default)
-    parameters: StrategyParameters  # Required field (no default)
-    version: str = "1.0.0"      # Optional field (has default)
+    name: str
+    version: str = "1.0.0"
+    parameters: StrategyParameters = field(default_factory=StrategyParameters)
     dependencies: Dict[str, 'StrategyConfig'] = field(default_factory=dict)
     enabled: bool = True
+
+    def __hash__(self):
+        # Convert parameters to a dictionary and sort items for hashing
+        param_items = tuple(sorted(self.parameters.dict().items()))
+        # Convert dependencies to a tuple of (key, hash(value)) for hashing
+        dep_items = tuple((k, hash(v)) for k, v in sorted(self.dependencies.items()))
+        return hash((self.name, self.version, param_items, dep_items, self.enabled))
+
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -90,14 +97,13 @@ class StrategyConfig:
         }
     
     def to_json(self) -> str:
-        """Serialize config to JSON string for caching"""
         return json.dumps({
             'name': self.name,
             'version': self.version,
             'parameters': self.parameters.dict(),
             'dependencies': {k: v.to_dict() for k, v in self.dependencies.items()},
             'enabled': self.enabled
-        }, sort_keys=True)    
+        }, sort_keys=True)
 
 # --------------------------
 # Strategy Factory Implementation
@@ -118,23 +124,26 @@ class StrategyFactory(Generic[T]):
 
     @classmethod
     @lru_cache(maxsize=_cache_size)
-    def create_strategy(cls, config_json: str) -> T:
+    def create_strategy(cls, config: StrategyConfig) -> T:
         """Create strategy instance with JSON-serialized config"""
         
         try:
-            config = StrategyConfig(**json.loads(config_json))
+            #config = StrategyConfig(**json.loads(config_json))
             strategy_class, param_model = cls._resolve_strategy_class(config.name, config.version)
             validated_params = param_model(**config.parameters.dict())
-            dependencies = cls._resolve_dependencies(config.dependencies)
             
+            # Resolve dependencies recursively
+            dependencies = {
+                name: cls.create_strategy(dep_config)
+                for name, dep_config in config.dependencies.items()
+            }
+
+            # Create and return the strategy instance
             return strategy_class(
                 **validated_params.dict(),
                 **dependencies
             )
-        
-        except json.JSONDecodeError as je:
-            logger.error(f"Invalid config JSON: {je}")
-            raise StrategyCreationError("Invalid configuration format") from je
+    
         
         except ValidationError as ve:
             logger.error(f"Parameter validation failed: {ve}")
@@ -196,7 +205,7 @@ class StrategyFactory(Generic[T]):
                 logger.warning(f"Dependency {dep_name} is disabled")
                 continue
                 
-            dep_instance = cls.create(dep_config)
+            dep_instance = cls.create_strategy(dep_config.to_json())
             if not isinstance(dep_instance, TradingStrategy):
                 raise DependencyResolutionError(f"Dependency {dep_name} is not a valid strategy")
             
@@ -241,4 +250,3 @@ class BaseStrategy(TradingStrategy, ParameterizedStrategy):
 
     def get_parameters(self) -> Dict[str, Any]:
         return {field: getattr(self, field) for field in self.required_parameters()}
-    
